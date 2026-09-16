@@ -1322,100 +1322,98 @@
   /* ==========================================================================
    * 设置与数据弹窗
    * ======================================================================== */
+  /* ==========================================================================
+   * 设置面板
+   *   设计原则：界面上不出现、也不允许修改任何凭据（云端 URL / anon key /
+   *   访问码 / AI Key）。这些一律由部署配置（config.js）提供，程序内部读取。
+   *   这样既避免成员误改导致全员不可用，也避免凭据出现在页面 DOM 里。
+   * ======================================================================== */
+
+  /** 只显示「能安全公开」的部署信息：项目 ref 与各项是否已配置 */
+  function renderDeployInfo() {
+    const box = $('deployInfo');
+    if (!box) return;
+    const s = S.getSettings();
+    box.innerHTML = '';
+
+    const row = (label, value, okFlag) => {
+      const d = el('div', 'admin-row');
+      const left = el('div');
+      left.appendChild(el('div', null, label));
+      if (value) left.appendChild(el('div', 'admin-meta', value));
+      d.appendChild(left);
+      d.appendChild(el('span', 'badge ' + (okFlag ? 'badge-ok' : 'badge-na'), okFlag ? '已配置' : '未配置'));
+      box.appendChild(d);
+    };
+
+    // 从 URL 里只取项目 ref（公开信息），不显示完整地址与密钥。
+    // Supabase 的项目 ref 是 20 位小写字母数字，不含连字符；
+    // 但也兼容带连字符的自定义域名（此时仅显示域名前缀，仍不含密钥）。
+    const url = String(s.cloudUrl || '');
+    const strictRef = url.match(/^https?:\/\/([a-z0-9]{15,})\.supabase\.co/i);
+    const hostMatch = url.match(/^https?:\/\/([a-z0-9.\-]+)/i);
+    const refLabel = strictRef ? strictRef[1]
+      : (hostMatch ? hostMatch[1].split('.')[0] + '（自定义域名）' : '');
+    row('云端项目', refLabel ? 'ref：' + refLabel : '未配置云端地址', !!url && !!refLabel);
+    row('访问码', '已由部署方配置，不在界面显示', !!s.cloudCode);
+    row('anon key', '已由部署方配置，不在界面显示', !!s.cloudKey);
+    row('AI 调用方式',
+      s.aiProxyUrl ? '经服务端代理（密钥不在浏览器中）'
+        : (s.apiKey ? '本机 API Key 直连' : '未配置'),
+      !!(s.aiProxyUrl || s.apiKey));
+    row('模型', s.model || '—', !!s.model);
+  }
+
   function openSettings() {
     const s = S.getSettings();
-    $('setApiKey').value = s.apiKey || '';
-    $('setAiProxyUrl').value = s.aiProxyUrl || '';
-    $('setModel').value = s.model || 'deepseek-flash';
-    $('setApiBase').value = s.apiBase || 'https://api.deepseek.com';
-    $('setBootstrapB').value = s.bootstrapB || 4000;
-    $('setAlpha').value = String(s.alpha || 0.05);
-    $('setMaxTokens').value = s.maxTokens || 16000;
-    $('setCloudUrl').value = s.cloudUrl || '';
-    $('setCloudKey').value = s.cloudKey || '';
-    $('setCloudCode').value = s.cloudCode || '';
-    $('setCloudMode').value = s.cloudMode || 'dual';
-    $('keyTestResult').textContent = '';
-    $('cloudTestResult').textContent = '';
-    $('importConfigResult').textContent = '';
+    if ($('setModel')) $('setModel').value = s.model || 'deepseek-flash';
+    if ($('setBootstrapB')) $('setBootstrapB').value = s.bootstrapB || 4000;
+    if ($('setAlpha')) $('setAlpha').value = String(s.alpha || 0.05);
+    if ($('setMaxTokens')) $('setMaxTokens').value = s.maxTokens || 16000;
+    if ($('setCloudMode')) $('setCloudMode').value = s.cloudMode || 'dual';
+    if ($('cloudTestResult')) $('cloudTestResult').textContent = '';
+    renderDeployInfo();
     applyDeploymentLock();
     $('settingsMask').hidden = false;
   }
+  function closeSettings() { $('settingsMask').hidden = true; }
 
-  /** 部署方锁定的字段：禁用并标注来源，防止成员误改导致全员不可用 */
+  /** 由部署方指定的项：禁用并标注来源，防止成员误改 */
   function applyDeploymentLock() {
-    const lock = (id, key, label) => {
+    const lock = (id, key) => {
       const n = $(id);
       if (!n) return;
       const locked = S.isLocked(key);
       n.disabled = locked;
       const span = n.parentElement ? n.parentElement.querySelector('span') : null;
-      if (span && locked) {
-        if (!span.querySelector('.lock-tag')) {
-          const tag = el('em', 'lock-tag', '（由部署方统一配置，不可修改）');
-          span.appendChild(tag);
-        }
-      } else if (span) {
+      if (!span) return;
+      if (locked && !span.querySelector('.lock-tag')) {
+        span.appendChild(el('em', 'lock-tag', '（由部署方统一配置）'));
+      } else if (!locked) {
         const t = span.querySelector('.lock-tag');
         if (t) t.remove();
       }
     };
-    lock('setCloudUrl', 'cloudUrl');
-    lock('setCloudKey', 'cloudKey');
-    lock('setCloudCode', 'cloudCode');
     lock('setCloudMode', 'cloudMode');
     lock('setModel', 'model');
-    lock('setApiBase', 'apiBase');
-    lock('setAiProxyUrl', 'aiProxyUrl');
-    lock('setApiKey', 'apiKey');
-    // 使用代理时，Key 字段整块隐藏（前端根本不需要它）。
-    // 判断依据是「当前生效的设置」，而不是仅看部署配置——
-    // 这样通过配置串导入代理地址时同样能正确隐藏。
-    const eff = S.getSettings();
-    const usingProxy = !!(eff.aiProxyUrl && String(eff.aiProxyUrl).trim());
-    const keyField = $('setApiKey').closest('.field');
-    const testRow = $('btnTestKey').closest('.row-inline');
-    if (keyField) keyField.hidden = usingProxy;
-    if (testRow) testRow.hidden = usingProxy;
-    const hint = $('apiKeyHint');
-    if (hint) {
-      hint.textContent = usingProxy
-        ? '已启用服务端代理，无需 API Key'
-        : '仅在未使用代理时需要；仅保存在本机浏览器';
-    }
   }
-  function closeSettings() { $('settingsMask').hidden = true; }
 
-  /** 保存设置（含云端）。云端连接状态变化时自动拉取一次。 */
+  /** 保存设置（界面上只剩非凭据项） */
   function saveSettingsFromForm(opts) {
     const quiet = opts && opts.quiet;
-    const before = S.getSettings();
-    const cloudUrlRaw = $('setCloudUrl').value.trim();
-    const cloudUrl = cloudUrlRaw ? CL.normalizeUrl(cloudUrlRaw) : '';
-    S.saveSettings({
-      apiKey: $('setApiKey').value.trim(),
-      aiProxyUrl: CL.normalizeProxyUrl($('setAiProxyUrl').value.trim()),
-      model: $('setModel').value,
-      apiBase: $('setApiBase').value.trim() || 'https://api.deepseek.com',
-      bootstrapB: Number($('setBootstrapB').value) || 4000,
-      alpha: Number($('setAlpha').value) || 0.05,
-      maxTokens: Number($('setMaxTokens').value) || 16000,
-      cloudUrl: cloudUrl,
-      cloudKey: $('setCloudKey').value.trim(),
-      cloudCode: $('setCloudCode').value,
-      cloudMode: $('setCloudMode').value,
-    });
-    // 地址被换算过则回填，让用户看到实际使用的地址
-    if (cloudUrl && cloudUrl !== cloudUrlRaw) $('setCloudUrl').value = cloudUrl;
+    const patch = {};
+    if ($('setModel')) patch.model = $('setModel').value;
+    if ($('setBootstrapB')) patch.bootstrapB = Number($('setBootstrapB').value) || 4000;
+    if ($('setAlpha')) patch.alpha = Number($('setAlpha').value) || 0.05;
+    if ($('setMaxTokens')) patch.maxTokens = Number($('setMaxTokens').value) || 16000;
+    if ($('setCloudMode')) patch.cloudMode = $('setCloudMode').value;
+    S.saveSettings(patch);
     if (!quiet) toast('设置已保存', 'ok');
     if (!quiet) closeSettings();
     if (state.result) renderResult();
     updateCloudStatus();
-    // 连接信息发生变化时清掉旧会话，避免用旧项目的令牌访问新项目
-    if (before.cloudUrl !== cloudUrl || before.cloudKey !== $('setCloudKey').value.trim()) {
-      CL.disconnect();
-    }
   }
+  function closeSettings() { $('settingsMask').hidden = true; }
 
   function openData() { renderProjectAdmin(); $('dataMask').hidden = false; }
   function closeData() { $('dataMask').hidden = true; }
@@ -1436,18 +1434,6 @@
   }
 
   function safeName(n) { return String(n).replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40); }
-
-  function copyToClipboard(text) {
-    // 注意：clipboard.writeText 返回 Promise，同步 try/catch 接不住它的拒绝
-    // （页面未获得焦点时会抛 NotAllowedError），必须显式 catch，否则成为未捕获异常。
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).catch(() => { /* 未获焦点或无权限，退回手动复制 */ });
-        return true;
-      }
-    } catch (e) { /* 同步异常，同样退回手动复制 */ }
-    return false;
-  }
 
   function download(text, filename) {
     const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
@@ -1549,46 +1535,20 @@
     $('btnCloseSettings').addEventListener('click', closeSettings);
     $('btnSettingsCancel').addEventListener('click', closeSettings);
     $('btnSettingsSave').addEventListener('click', saveSettingsFromForm);
-    $('btnToggleKey').addEventListener('click', () => {
-      const i = $('setApiKey');
-      const showing = i.type === 'text';
-      i.type = showing ? 'password' : 'text';
-      $('btnToggleKey').textContent = showing ? '显示' : '隐藏';
-    });
-    $('btnTestKey').addEventListener('click', async () => {
-      const out = $('keyTestResult');
-      const key = $('setApiKey').value.trim();
-      if (!key) { out.textContent = '请先填入 Key。'; return; }
-      out.textContent = '测试中…';
-      try {
-        const r = await AI.testKey(key, $('setModel').value, $('setApiBase').value.trim());
-        out.textContent = '✓ 可用（模型：' + r.model + '）';
-      } catch (e) {
-        out.textContent = '✗ ' + e.message;
-      }
-    });
 
-    /* ---------- 云端 ---------- */
+    /* ---------- 云端 ----------
+     * 凭据全部来自部署配置（config.js），界面上没有输入框，
+     * 因此这里只负责「连接」这个动作本身。 */
     $('btnCloudConnect').addEventListener('click', async () => {
       const out = $('cloudTestResult');
-      const urlRaw = $('setCloudUrl').value.trim();
-      if (!urlRaw) { out.textContent = '请先填写 Supabase URL。'; return; }
-      const url = CL.normalizeUrl(urlRaw);
-      $('setCloudUrl').value = url;
-      const key = $('setCloudKey').value.trim();
-      const code = $('setCloudCode').value;
-      if (!key) { out.textContent = '请先填写 anon public key。'; return; }
-      if (!code) { out.textContent = '请先填写访问码。'; return; }
-      if (/service_role/i.test(key)) {
-        out.textContent = '✗ 这是 service_role key，请改用 anon public key（它拥有完全控制权，泄漏风险极高）。';
+      const st = S.getSettings();
+      if (!CL.isConfigured(st)) {
+        out.textContent = '✗ 云端未配置：请联系管理员在 config.js 中填写云端地址、密钥与访问码。';
         return;
       }
       out.textContent = '连接中…';
       try {
-        // 先落盘设置，再连接
-        $('setCloudKey').value = key;
-        saveSettingsFromForm({ quiet: true });
-        const r = await CL.connect(S.getSettings());
+        const r = await CL.connect(st);
         out.textContent = '✓ 已连接（成员标识 ' + (r.userId ? r.userId.slice(0, 8) : '—') + '）';
         updateCloudStatus();
         await cloudPull({ quiet: true });
@@ -1605,56 +1565,10 @@
       if (!window.confirm('断开云端？本机已保存的数据不受影响，之后不再同步到云端。')) return;
       CL.disconnect();
       S.saveSettings({ cloudMode: 'local' });
-      $('setCloudMode').value = 'local';
+      if ($('setCloudMode')) $('setCloudMode').value = 'local';
       $('cloudTestResult').textContent = '已断开。若要再次启用，请把同步方式改回「双写」并重新连接。';
       updateCloudStatus();
       toast('已断开云端，当前为纯本地模式', 'ok');
-    });
-
-    /* ---------- 配置分发 ---------- */
-    $('btnExportConfig').addEventListener('click', () => {
-      const text = S.exportConfigString(true);
-      const okCopy = copyToClipboard(text);
-      const box = $('importConfigBox');
-      const btnRow = $('importConfigBtns');
-      box.hidden = false;
-      btnRow.hidden = false;
-      $('importConfigText').value = text;
-      $('importConfigResult').textContent = okCopy
-        ? '✓ 配置串已复制到剪贴板（含 API Key，请只发内部渠道）'
-        : '已生成，请手动全选下方文本复制（含 API Key，请只发内部渠道）';
-      $('importConfigText').select();
-    });
-
-    $('btnImportConfig').addEventListener('click', () => {
-      const box = $('importConfigBox');
-      const btnRow = $('importConfigBtns');
-      const showing = !box.hidden;
-      box.hidden = showing;
-      btnRow.hidden = showing;
-      if (!showing) {
-        $('importConfigText').value = '';
-        $('importConfigResult').textContent = '';
-        $('importConfigText').focus();
-      }
-    });
-
-    $('btnApplyConfig').addEventListener('click', async () => {
-      const out = $('importConfigResult');
-      out.textContent = '应用中…';
-      try {
-        const res = S.importConfigString($('importConfigText').value);
-        out.textContent = '✓ 已应用 ' + res.applied.length + ' 项配置';
-        toast('配置已导入，正在刷新设置', 'ok');
-        openSettings();
-        out.textContent = '✓ 已应用 ' + res.applied.length + ' 项配置，可点「测试并连接」验证';
-        const st = S.getSettings();
-        if ((st.cloudMode || 'dual') !== 'local' && CL.isConfigured(st)) {
-          await cloudPull({ quiet: true });
-        }
-      } catch (e) {
-        out.textContent = '✗ ' + e.message;
-      }
     });
 
     $('btnData').addEventListener('click', openData);

@@ -540,70 +540,86 @@ async function main() {
     ok(shot3.data.length > 1000, '方法说明页截图已生成');
     ok(await saveShot(shot3, path.join(SHOT_DIR, '03-method.png')), '方法说明页截图已落盘');
 
-    /* ---------- 部署配置：打开即用 ---------- */
-    console.log('\n=== 14. 部署配置（config.js）打开即用 ===');
+    /* ---------- 部署配置：打开即用，且界面不出现凭据 ---------- */
+    console.log('\n=== 14. 部署配置生效 + 设置界面不含任何凭据 ===');
     const deploy = await cdp.eval(`
       const s = window.QCStore.getSettings();
       document.getElementById('btnSettings').click();
+      const modal = document.getElementById('settingsMask');
+      const html = modal.innerHTML;
+      const infoText = (document.getElementById('deployInfo') || {}).textContent || '';
       const disp = (id) => {
         const n = document.getElementById(id);
-        return { value: n.value, disabled: n.disabled };
+        return n ? { value: n.value, disabled: n.disabled, exists: true } : { exists: false };
       };
       return {
         hasConfig: typeof window.QC_CONFIG === 'object',
         settings: {
           cloudUrl: s.cloudUrl, cloudCode: s.cloudCode, cloudMode: s.cloudMode,
-          model: s.model, apiBase: s.apiBase, apiKey: s.apiKey,
+          model: s.model, aiProxyUrl: s.aiProxyUrl, apiKey: s.apiKey,
         },
         ui: {
-          cloudUrl: disp('setCloudUrl'),
-          cloudCode: disp('setCloudCode'),
-          cloudKey: disp('setCloudKey'),
           cloudMode: disp('setCloudMode'),
           model: disp('setModel'),
-          apiKey: disp('setApiKey'),
+          bootstrapB: disp('setBootstrapB'),
         },
-        lockedTags: document.querySelectorAll('#settingsMask .lock-tag').length,
+        // 界面上是否还存在任何凭据输入框
+        credentialInputs: ['setApiKey', 'setCloudUrl', 'setCloudKey', 'setCloudCode',
+                           'setAiProxyUrl', 'setApiBase']
+          .filter((id) => document.getElementById(id) !== null),
+        // 页面上是否出现任何真实凭据
+        leaks: {
+          anonKey: html.indexOf('test-anon-key-for-locking-check-only') >= 0,
+          accessCode: html.indexOf('test-deploy-code') >= 0,
+          proxyUrlInDom: html.indexOf('ai-proxy') >= 0,
+        },
+        infoText: infoText,
+        passwordInputs: modal.querySelectorAll('input[type="password"]').length,
       };
     `);
     ok(deploy.hasConfig === true, 'config.js 已加载');
     ok(deploy.settings.cloudUrl === 'https://test-project.supabase.co',
-      '云端 URL 由部署配置自动提供（无需成员输入）', deploy.settings.cloudUrl);
-    ok(deploy.settings.cloudCode === 'test-deploy-code', '访问码由部署配置自动提供', deploy.settings.cloudCode);
-    ok(deploy.settings.cloudMode === 'local', '同步方式来自部署配置（本套测试隔离为仅本地）');
+      '云端 URL 由部署配置提供（无需成员输入）', deploy.settings.cloudUrl);
+    ok(deploy.settings.cloudCode === 'test-deploy-code', '访问码由部署配置提供');
+    ok(deploy.settings.cloudMode === 'local', '同步方式来自部署配置');
     ok(deploy.settings.model === 'deepseek-flash', '模型由部署配置提供');
-    ok(deploy.ui.cloudUrl.value === deploy.settings.cloudUrl, '设置面板里 URL 已自动填好');
-    ok(deploy.ui.cloudCode.value === 'test-deploy-code', '设置面板里访问码已自动填好');
-    ok(deploy.ui.cloudKey.value === 'test-anon-key-for-locking-check-only', '设置面板里 anon key 已自动填好');
-    ok(deploy.ui.cloudUrl.disabled === true, 'URL 字段被锁定（防止成员误改）');
-    ok(deploy.ui.cloudCode.disabled === true, '访问码字段被锁定');
-    ok(deploy.ui.apiKey.disabled === true || deploy.ui.apiKey.hidden === true,
-      'AI Key 字段：启用代理时隐藏或锁定（前端不需要 Key）', JSON.stringify(deploy.ui.apiKey));
-    ok(deploy.lockedTags >= 4, '界面标注了「由部署方统一配置」', String(deploy.lockedTags));
+    ok(!!deploy.settings.aiProxyUrl, '代理地址由部署配置提供');
 
-    /* ---------- 配置串导出/导入 ---------- */
-    console.log('\n=== 15. 配置串导出与导入 ===');
+    // 核心断言：界面上不再有任何凭据字段
+    ok(deploy.credentialInputs.length === 0,
+      '设置界面已无任何凭据输入框', deploy.credentialInputs.join(', '));
+    ok(deploy.passwordInputs === 0, '设置界面不再有密码类输入框', String(deploy.passwordInputs));
+    ok(deploy.leaks.anonKey === false, '设置界面 DOM 中不出现 anon key');
+    ok(deploy.leaks.accessCode === false, '设置界面 DOM 中不出现访问码');
+    ok(deploy.leaks.proxyUrlInDom === false, '设置界面 DOM 中不出现代理地址');
+    ok(/ref[：:]/.test(deploy.infoText), '部署信息只显示项目 ref（公开信息）', deploy.infoText.slice(0, 120));
+    ok(!/sk-/.test(deploy.infoText), '部署信息中不含任何 sk- 形式的密钥');
+    ok(deploy.ui.cloudMode.exists === true, '同步方式仍可调整（非凭据项）');
+    ok(deploy.ui.model.exists === true, '模型选择仍可见');
+
+    /* ---------- 配置串能力（保留在存储层，界面不再暴露） ---------- */
+    console.log('\n=== 15. 配置串能力（存储层，界面不暴露）===');
     const cfgRound = await cdp.eval(`
-      document.getElementById('btnExportConfig').click();
-      const text = document.getElementById('importConfigText').value;
-      const boxShown = !document.getElementById('importConfigBox').hidden;
+      const text = window.QCStore.exportConfigString(true);
       // 模拟另一台设备：清空本机设置后导入
       localStorage.removeItem('qceval:settings');
-      const before = window.QCStore.getSettings().cloudUrl;
       const res = window.QCStore.importConfigString(text);
       const after = window.QCStore.getSettings();
       return {
-        prefix: text.slice(0, 8), len: text.length, boxShown,
-        beforeUrl: before, applied: res.applied.length,
+        prefix: text.slice(0, 8), len: text.length,
+        applied: res.applied.length,
         afterUrl: after.cloudUrl, afterCode: after.cloudCode, afterMode: after.cloudMode,
+        // 确认界面没有导出入口（避免成员把含密钥的配置串复制出去）
+        hasExportBtn: !!document.getElementById('btnExportConfig'),
+        hasImportBtn: !!document.getElementById('btnImportConfig'),
       };
     `);
-    ok(cfgRound.prefix === 'QCEVAL1:', '导出的是可分享的配置串', cfgRound.prefix);
-    ok(cfgRound.boxShown === true, '导出后自动显示配置串便于复制');
-    ok(cfgRound.applied >= 8, '导入应用了多项配置', String(cfgRound.applied));
-    ok(cfgRound.afterUrl === 'https://test-project.supabase.co', '导入后云端 URL 正确', cfgRound.afterUrl);
-    ok(cfgRound.afterCode === 'test-deploy-code', '导入后访问码正确');
-    ok(cfgRound.afterMode === 'local', '导入后同步方式正确');
+    ok(cfgRound.prefix === 'QCEVAL1:', '存储层仍可导出配置串（备用能力）', cfgRound.prefix);
+    ok(cfgRound.applied >= 8, '配置串往返导入应用了多项配置', String(cfgRound.applied));
+    ok(cfgRound.afterUrl === 'https://test-project.supabase.co', '配置串往返后 URL 正确', cfgRound.afterUrl);
+    ok(cfgRound.afterCode === 'test-deploy-code', '配置串往返后访问码正确');
+    ok(cfgRound.hasExportBtn === false, '界面上已无「导出配置串」入口（防止密钥外流）');
+    ok(cfgRound.hasImportBtn === false, '界面上已无「导入配置串」入口');
 
     const cfgBad = await cdp.eval(`
       const out = [];
@@ -630,14 +646,14 @@ async function main() {
         document.getElementById('btnCalc').click();
         await new Promise(r => setTimeout(r, 500));
         document.getElementById('btnSettings').click();
-        await new Promise(r => setTimeout(r, 200));
-        const keyField = document.getElementById('setApiKey').closest('.field');
-        const testRow = document.getElementById('btnTestKey').closest('.row-inline');
+        await new Promise(r => setTimeout(r, 250));
+        const modal = document.getElementById('settingsMask');
         const result = {
-          proxyValue: document.getElementById('setAiProxyUrl').value,
-          keyFieldHidden: keyField.hidden,
-          testRowHidden: testRow.hidden,
-          hint: (document.getElementById('apiKeyHint') || {}).textContent || '',
+          proxyUrl: window.QCStore.getSettings().aiProxyUrl,
+          infoText: (document.getElementById('deployInfo') || {}).textContent || '',
+          credentialInputs: ['setApiKey', 'setAiProxyUrl', 'setCloudUrl', 'setCloudKey', 'setCloudCode']
+            .filter((id) => document.getElementById(id) !== null),
+          leaksInDom: modal.innerHTML.indexOf('sk-') >= 0,
         };
         document.getElementById('btnCloseSettings').click();
         await new Promise(r => setTimeout(r, 300));
@@ -645,12 +661,12 @@ async function main() {
         return result;
       })();
     `);
-    ok(/ai-proxy|favicon/.test(proxyMode.proxyValue),
-      '代理地址已在设置面板中填好（管理员配置，成员无需输入）', proxyMode.proxyValue);
-    ok(proxyMode.keyFieldHidden === true,
-      '启用代理后，API Key 输入框整块隐藏（前端已不需要 Key）');
-    ok(proxyMode.testRowHidden === true, '启用代理后，Key 测试按钮一并隐藏');
-    ok(/已启用服务端代理/.test(proxyMode.hint), '文案说明当前无需 API Key', proxyMode.hint);
+    ok(/functions\/v1\/ai-proxy|favicon/.test(proxyMode.proxyUrl),
+      '代理地址由部署配置提供（成员无需输入）', proxyMode.proxyUrl);
+    ok(proxyMode.credentialInputs.length === 0,
+      '启用代理时界面完全没有凭据输入框', proxyMode.credentialInputs.join(', '));
+    ok(/服务端代理/.test(proxyMode.infoText), '部署信息标明经服务端代理调用', proxyMode.infoText.slice(0, 140));
+    ok(proxyMode.leaksInDom === false, '设置界面 DOM 中不含 sk- 形式的密钥');
     ok(/服务端代理/.test(proxyMode.status), 'AI 状态行标注为服务端代理', proxyMode.status);
 
     // 「无代理」形态：另起一个独立服务提供「没有 aiProxyUrl」的部署配置。
@@ -687,9 +703,10 @@ async function main() {
         r.status = (document.querySelector('#resultZone .ai-status') || {}).textContent || '';
         document.getElementById('btnSettings').click();
         await new Promise(res => setTimeout(res, 250));
-        const keyField = document.getElementById('setApiKey').closest('.field');
-        r.keyFieldHidden = keyField.hidden;
-        r.hint = (document.getElementById('apiKeyHint') || {}).textContent || '';
+        r.infoText = (document.getElementById('deployInfo') || {}).textContent || '';
+        // 未配置代理时界面同样不出现任何凭据输入框
+        r.credentialInputs = ['setApiKey', 'setAiProxyUrl', 'setCloudUrl', 'setCloudKey', 'setCloudCode']
+          .filter((id) => document.getElementById(id) !== null);
         document.getElementById('btnCloseSettings').click();
         await new Promise(res => setTimeout(res, 250));
         const aiBtn = document.getElementById('btnRunAI');
@@ -702,8 +719,9 @@ async function main() {
     `);
     ok(noProxy.hasCalc === true, '（无代理形态）页面正常加载');
     ok(!noProxy.effProxy, '未配置代理时生效设置中无代理地址', String(noProxy.effProxy));
-    ok(noProxy.keyFieldHidden === false, '未配置代理时，API Key 字段可见');
-    ok(/仅在未使用代理时需要/.test(noProxy.hint), '提示说明 Key 仅在无代理时需要', noProxy.hint);
+    ok(noProxy.credentialInputs.length === 0,
+      '未配置代理时界面同样不含凭据输入框', noProxy.credentialInputs.join(', '));
+    ok(/未配置/.test(noProxy.infoText), '部署信息如实标注 AI 调用方式未配置', noProxy.infoText.slice(0, 140));
     ok(/未配置 AI 调用方式/.test(noProxy.status), '状态行提示需配置调用方式', noProxy.status);
     ok(noProxy.hasAiBtn === true, '（无代理形态）AI 卡片已渲染');
     ok(noProxy.settingsOpened === true, '未配置调用方式时点「生成分析」自动打开设置面板');

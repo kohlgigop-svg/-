@@ -283,37 +283,40 @@
       <button class="icon-btn" id="btnCloseSettings" type="button" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
-      <div class="subhead"><h3>AI 分析</h3></div>
-      <label class="field">
-        <span>AI 代理地址<em>由服务端调用模型，前端无需 API Key（推荐）</em></span>
-        <input type="text" id="setAiProxyUrl" placeholder="https://xxxx.supabase.co/functions/v1/ai-proxy" autocomplete="off">
-      </label>
-      <label class="field">
-        <span>API Key<em id="apiKeyHint">仅在未使用代理时需要；仅保存在本机浏览器</em></span>
-        <div class="row-inline">
-          <input type="password" id="setApiKey" placeholder="sk-..." autocomplete="off">
-          <button class="btn btn-mini" id="btnToggleKey" type="button">显示</button>
-        </div>
-      </label>
-      <div class="row-inline gap">
-        <button class="btn btn-mini" id="btnTestKey" type="button">测试连接</button>
-        <span class="hint tiny" id="keyTestResult"></span>
-      </div>
+      <p class="hint">
+        云端地址、访问码、模型等由部署方统一配置，<strong>本页不显示也不允许修改任何凭据</strong>，
+        以免误改导致全员不可用或凭据外泄。
+      </p>
 
-      <div class="form-row">
+      <div class="subhead"><h3>部署信息</h3></div>
+      <div id="deployInfo"></div>
+
+      <div class="subhead"><h3>云端共享</h3></div>
+      <div class="row-inline gap">
+        <button class="btn btn-mini" id="btnCloudConnect" type="button">连接云端</button>
+        <button class="btn btn-mini btn-ghost" id="btnCloudPull" type="button">立即拉取云端数据</button>
+        <button class="btn btn-mini btn-ghost btn-danger" id="btnCloudDisconnect" type="button">断开云端</button>
+        <span class="hint tiny" id="cloudTestResult"></span>
+      </div>
+      <div class="form-row" style="margin-top:10px">
         <label class="field">
-          <span>模型</span>
+          <span>同步方式<em>数据是否写入云端</em></span>
+          <select id="setCloudMode">
+            <option value="dual">双写：本地 + 云端（推荐）</option>
+            <option value="cloud">仅云端</option>
+            <option value="local">仅本地（不使用云端）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>模型<em>由部署方配置</em></span>
           <select id="setModel">
             <option value="deepseek-flash">deepseek-flash（快，推荐）</option>
             <option value="deepseek-v4-pro">deepseek-v4-pro（更强，较慢）</option>
           </select>
         </label>
-        <label class="field">
-          <span>接口地址</span>
-          <input type="text" id="setApiBase" placeholder="https://api.deepseek.com">
-        </label>
       </div>
 
+      <div class="subhead"><h3>计算参数</h3></div>
       <div class="form-row">
         <label class="field">
           <span>Bootstrap 次数</span>
@@ -328,7 +331,6 @@
           </select>
         </label>
       </div>
-
       <label class="field">
         <span>AI 输出预算 max_tokens<em>推理模型的思维链与正文共用此预算，过小会导致正文被截断</em></span>
         <input type="number" id="setMaxTokens" min="2000" max="32000" step="1000">
@@ -338,62 +340,9 @@
         若出现「输出被截断」提示，请调高此值（建议 16000 以上）。
       </p>
 
-      <div class="subhead"><h3>云端共享（Supabase）</h3></div>
       <p class="hint">
-        配置后，数据会同时存到云端，同一访问码下的成员可共享全部项目与记录。
-        详细步骤见仓库 <code>supabase/README.md</code>。
-      </p>
-
-      <label class="field">
-        <span>Supabase URL<em>填 https://xxxx.supabase.co 即可，填控制台地址会自动换算</em></span>
-        <input type="text" id="setCloudUrl" placeholder="https://xxxxxxxx.supabase.co" autocomplete="off">
-      </label>
-      <label class="field">
-        <span>anon public key<em>Project Settings → API 里的 anon key，切勿填 service_role</em></span>
-        <input type="password" id="setCloudKey" placeholder="eyJhbGciOi..." autocomplete="off">
-      </label>
-      <div class="form-row">
-        <label class="field">
-          <span>访问码</span>
-          <input type="password" id="setCloudCode" placeholder="与数据库中的哈希一致" autocomplete="off">
-        </label>
-        <label class="field">
-          <span>同步方式</span>
-          <select id="setCloudMode">
-            <option value="dual">双写：本地 + 云端（推荐）</option>
-            <option value="cloud">仅云端</option>
-            <option value="local">仅本地（不使用云端）</option>
-          </select>
-        </label>
-      </div>
-      <div class="row-inline gap">
-        <button class="btn btn-mini" id="btnCloudConnect" type="button">测试并连接</button>
-        <button class="btn btn-mini btn-ghost" id="btnCloudPull" type="button">立即拉取云端数据</button>
-        <button class="btn btn-mini btn-ghost btn-danger" id="btnCloudDisconnect" type="button">断开云端</button>
-        <span class="hint tiny" id="cloudTestResult"></span>
-      </div>
-
-      <div class="subhead"><h3>配置分发（管理员用）</h3></div>
-      <p class="hint">
-        管理员在本机配置好后导出配置串，发到内部群；成员在「设置」里粘贴一次即可，
-        之后不需要再填任何参数。<strong>配置串含 API Key，请只发内部渠道，不要贴到公开网页。</strong>
-      </p>
-      <div class="row-inline gap">
-        <button class="btn btn-mini" id="btnExportConfig" type="button">导出配置串</button>
-        <button class="btn btn-mini" id="btnImportConfig" type="button">导入配置串</button>
-      </div>
-      <label class="field" id="importConfigBox" hidden>
-        <span>粘贴配置串<em>以 QCEVAL1: 开头</em></span>
-        <textarea id="importConfigText" rows="3" placeholder="QCEVAL1:eyJhcHAiOiJxYy1ldmFsLWNvbmZpZyIs..." style="width:100%;font-family:ui-monospace,monospace;font-size:11.5px;padding:6px 9px;border:1px solid var(--border-strong);border-radius:6px"></textarea>
-      </label>
-      <div class="row-inline gap" id="importConfigBtns" hidden>
-        <button class="btn btn-mini btn-primary" id="btnApplyConfig" type="button">应用配置</button>
-        <span class="hint tiny" id="importConfigResult"></span>
-      </div>
-
-      <p class="hint">
-        说明：工具为纯前端页面，API Key 与云端凭据都存于本机 localStorage，不会上传到任何第三方服务器。
-        请勿在公用电脑上保存。数据库侧已开启行级权限，直接访问数据表会被拒绝，读写均走带访问码校验的函数。
+        说明：工具为纯前端页面。数据库侧已开启行级权限，直接访问数据表会被拒绝（实测返回 403），
+        读写均走带访问码校验的服务端函数；模型调用经服务端代理，DeepSeek 密钥不出现在浏览器中。
       </p>
     </div>
     <div class="modal-foot">
