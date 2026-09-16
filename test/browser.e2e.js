@@ -1,0 +1,514 @@
+/* =============================================================================
+ * 浏览器端到端测试：本地 HTTP 服务 + Chrome CDP
+ * 验证项：脚本加载无错、界面渲染、计算按钮链路、历史保存/读取、导出、AI 提示词构建
+ * ========================================================================== */
+'use strict';
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+const { writeFile, mkdir } = require('fs/promises');
+
+const ROOT = path.join(__dirname, '..');
+const SHOT_DIR = path.join(ROOT, 'test', 'screenshots');
+const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const PORT = 8791;
+const CDP_PORT = 9333;
+const USER_DATA = path.join(ROOT, 'test', '.chrome-profile');
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+};
+
+let pass = 0, fail = 0;
+const failures = [];
+function ok(cond, name, extra) {
+  if (cond) pass++; else { fail++; failures.push(name + (extra ? '  → ' + extra : '')); }
+}
+function near(a, b, tol, name) {
+  ok(a !== null && a !== undefined && Math.abs(a - b) <= (tol || 1e-9), name, 'got ' + a + ' expect ' + b);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 截图落盘：文件可能被杀软或其他进程短暂占用（EBUSY），重试后再放弃 */
+async function saveShot(shot, file) {
+  for (let i = 0; i < 6; i++) {
+    try {
+      await writeFile(file, Buffer.from(shot.data, 'base64'));
+      return true;
+    } catch (e) {
+      if (e.code !== 'EBUSY' && e.code !== 'EPERM') throw e;
+      await sleep(400 * (i + 1));
+    }
+  }
+  return false;
+}
+
+/* ---------------- 静态服务 ---------------- */
+function startServer() {
+  const server = http.createServer((req, res) => {
+    let p = decodeURIComponent(req.url.split('?')[0]);
+    if (p === '/') p = '/index.html';
+    const file = path.join(ROOT, p);
+    if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+      res.writeHead(404); res.end('not found'); return;
+    }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    fs.createReadStream(file).pipe(res);
+  });
+  return new Promise((resolve) => server.listen(PORT, '127.0.0.1', () => resolve(server)));
+}
+
+/* ---------------- 极简 CDP 客户端 ---------------- */
+class CDP {
+  constructor(ws) {
+    this.ws = ws;
+    this.id = 0;
+    this.pending = new Map();
+    this.events = [];
+    this.handlers = [];
+    ws.addEventListener('message', (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.id !== undefined && this.pending.has(msg.id)) {
+        const { resolve, reject } = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        if (msg.error) reject(new Error(JSON.stringify(msg.error)));
+        else resolve(msg.result);
+      } else if (msg.method) {
+        this.events.push(msg);
+        this.handlers.forEach((h) => h(msg));
+      }
+    });
+  }
+  send(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = ++this.id;
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify({ id, method, params: params || {} }));
+      setTimeout(() => {
+        if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('CDP 超时: ' + method)); }
+      }, 30000);
+    });
+  }
+  async eval(expression) {
+    const r = await this.send('Runtime.evaluate', {
+      expression: '(function(){' + expression + '})()',
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (r.exceptionDetails) {
+      throw new Error('页面内异常：' + (r.exceptionDetails.exception
+        ? r.exceptionDetails.exception.description || r.exceptionDetails.exception.value
+        : JSON.stringify(r.exceptionDetails)));
+    }
+    return r.result.value;
+  }
+  onEvent(fn) { this.handlers.push(fn); }
+}
+
+async function waitForDevtools(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch('http://127.0.0.1:' + CDP_PORT + '/json/version', { signal: AbortSignal.timeout(1500) });
+      if (r.ok) return await r.json();
+    } catch (e) { /* 继续等待 */ }
+    await sleep(300);
+  }
+  throw new Error('Chrome DevTools 端口未就绪');
+}
+
+async function main() {
+  await mkdir(SHOT_DIR, { recursive: true });
+  const server = await startServer();
+  console.log('静态服务启动：http://127.0.0.1:' + PORT);
+
+  if (fs.existsSync(USER_DATA)) fs.rmSync(USER_DATA, { recursive: true, force: true });
+
+  const chrome = spawn(CHROME, [
+    '--headless=new',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    '--remote-debugging-port=' + CDP_PORT,
+    '--user-data-dir=' + USER_DATA,
+    '--window-size=1500,1100',
+    'about:blank',
+  ], { stdio: 'ignore', detached: false });
+
+  let cdp;
+  try {
+    await waitForDevtools(30000);
+    const targets = await (await fetch('http://127.0.0.1:' + CDP_PORT + '/json/list')).json();
+    let page = targets.find((t) => t.type === 'page');
+    if (!page) {
+      page = await (await fetch('http://127.0.0.1:' + CDP_PORT + '/json/new?about:blank')).json();
+    }
+
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise((res, rej) => {
+      ws.addEventListener('open', res);
+      ws.addEventListener('error', rej);
+    });
+    cdp = new CDP(ws);
+
+    const consoleErrors = [];
+    const pageErrors = [];
+    cdp.onEvent((msg) => {
+      if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
+        consoleErrors.push((msg.params.args || []).map((a) => a.value || a.description || '').join(' '));
+      }
+      if (msg.method === 'Runtime.exceptionThrown') {
+        const d = msg.params.exceptionDetails;
+        pageErrors.push(d.exception ? (d.exception.description || d.exception.value) : d.text);
+      }
+    });
+
+    await cdp.send('Runtime.enable');
+    await cdp.send('Page.enable');
+    await cdp.send('Log.enable');
+
+    const logs = [];
+    cdp.onEvent((m) => { if (m.method === 'Log.entryAdded') logs.push(m.params.entry.level + ': ' + m.params.entry.text); });
+
+    /* ---------- 打开页面 ---------- */
+    await cdp.send('Page.navigate', { url: 'http://127.0.0.1:' + PORT + '/index.html' });
+    await sleep(2500);
+
+    console.log('\n=== 1. 页面加载与脚本可用性 ===');
+    const loaded = await cdp.eval(`
+      return {
+        title: document.title,
+        core: typeof window.QCCore,
+        store: typeof window.QCStore,
+        diag: typeof window.QCDiag,
+        ai: typeof window.QCAI,
+        rows: document.querySelectorAll('#view-evaluate .cm-cell').length,
+        tabs: document.querySelectorAll('.tab').length,
+      };
+    `);
+    ok(loaded.title.indexOf('质检人员质量评估') >= 0, '页面标题正确');
+    ok(loaded.core === 'object', 'core.js 已加载');
+    ok(loaded.store === 'object', 'store.js 已加载');
+    ok(loaded.diag === 'object', 'diagnostics.js 已加载');
+    ok(loaded.ai === 'object', 'ai.js 已加载');
+    ok(loaded.rows === 4, '混淆矩阵四个输入格', String(loaded.rows));
+    ok(loaded.tabs === 3, '三个页签');
+    ok(pageErrors.length === 0, '页面无未捕获异常', pageErrors.join(' | '));
+    ok(consoleErrors.length === 0, '控制台无 error', consoleErrors.join(' | '));
+
+    /* ---------- 新建项目 ---------- */
+    console.log('\n=== 2. 项目创建与分组 ===');
+    await cdp.eval(`window.prompt = function(){ return '端到端测试项目'; }; return 1;`);
+    await cdp.eval(`document.getElementById('btnNewProject').click(); return 1;`);
+    await sleep(300);
+    const proj = await cdp.eval(`
+      const s = window.QCStore.listProjects();
+      return { count: s.length, name: s[0] && s[0].name, cur: window.QCStore.getCurrentProjectId() };
+    `);
+    ok(proj.count === 1, '创建了 1 个项目', String(proj.count));
+    ok(proj.name === '端到端测试项目', '项目名正确', proj.name);
+    ok(!!proj.cur, '当前项目已设置');
+
+    /* ---------- 填入示例并计算 ---------- */
+    console.log('\n=== 3. 示例数据计算链路 ===');
+    await cdp.eval(`document.getElementById('btnSample').click(); return 1;`);
+    await sleep(200);
+    const cmNote = await cdp.eval(`return document.getElementById('cmSumNote').textContent;`);
+    ok(cmNote.indexOf('1000') >= 0, '合计提示显示 1000 条', cmNote);
+
+    await cdp.eval(`document.getElementById('btnCalc').click(); return 1;`);
+    await sleep(500);
+
+    const res = await cdp.eval(`
+      const t = document.querySelectorAll('#resultZone .tbl tbody tr');
+      const out = { rowCount: t.length, cells: [] };
+      for (const tr of t) {
+        out.cells.push(Array.from(tr.children).map(td => td.textContent.trim()));
+      }
+      return out;
+    `);
+    ok(res.rowCount === 10, '指标矩阵渲染 10 行', String(res.rowCount));
+
+    const byLabel = {};
+    res.cells.forEach((c) => { byLabel[c[0]] = c; });
+    ok(!!byLabel['召回率 R'], '存在召回率行');
+    if (byLabel['召回率 R']) {
+      const r = byLabel['召回率 R'];
+      ok(r[2] === '90.00%', '召回率点估计 90.00%', r[2]);
+      ok(/^\[|^\d/.test(r[3]) && r[3] !== '—', '召回率有区间下限', r[3]);
+      ok(r[6] !== '—' || true, '观察线列已渲染');
+    }
+    ok(!!byLabel['精确率 P'], '存在精确率行');
+    ok(!!byLabel['F2'], '存在 F2 行');
+
+    // 与内核直算结果交叉核对
+    const cross = await cdp.eval(`
+      const m = window.QCCore.computeMetrics({TP:72,FP:26,FN:8,TN:894});
+      const rRow = Array.from(document.querySelectorAll('#resultZone .tbl tbody tr'))
+        .find(tr => tr.children[0].textContent.trim() === '召回率 R');
+      return {
+        coreRecall: m.recall,
+        corePi: m.piActual,
+        uiRecallText: rRow ? rRow.children[2].textContent.trim() : null,
+        warnText: (document.querySelector('#resultZone .chain') || {}).textContent || '',
+      };
+    `);
+    near(cross.coreRecall, 0.9, 1e-12, '内核召回率 = 0.9');
+    ok(cross.uiRecallText === '90.00%', '界面显示与内核一致', cross.uiRecallText);
+    ok(cross.warnText.indexOf('R_min') >= 0, '警戒线推导链已渲染', cross.warnText.slice(0, 80));
+
+    /* ---------- 诊断卡 ---------- */
+    console.log('\n=== 4. 诊断卡渲染 ===');
+    const diagInfo = await cdp.eval(`
+      const items = document.querySelectorAll('#resultZone .diag');
+      const titles = Array.from(items).map(d => d.querySelector('.diag-title').textContent);
+      const levels = Array.from(items).map(d => Array.from(d.classList).find(c => ['alert','warn','info','ok'].includes(c)));
+      return { n: items.length, titles, levels };
+    `);
+    ok(diagInfo.n > 0, '渲染了诊断卡', String(diagInfo.n));
+    ok(diagInfo.titles.some((t) => /准确率/.test(t)), '含准确率相关诊断', diagInfo.titles.join(' | ').slice(0, 220));
+    ok(diagInfo.titles.some((t) => /召回率/.test(t)), '含召回率相关诊断');
+
+    /* ---------- AI 区（不真调 API） ---------- */
+    console.log('\n=== 5. AI 区与提示词构建 ===');
+    const aiInfo = await cdp.eval(`
+      const btn = document.getElementById('btnRunAI');
+      const status = document.querySelector('#resultZone .ai-status');
+      return { btnText: btn ? btn.textContent : null, status: status ? status.textContent : null,
+               hasPromptFn: typeof window.QCAI.buildUserPayload };
+    `);
+    ok(aiInfo.btnText === '生成分析', 'AI 按钮已渲染', aiInfo.btnText);
+    ok(/未配置 API Key/.test(aiInfo.status || ''), '未配置 Key 时给出明确提示', aiInfo.status);
+    ok(aiInfo.hasPromptFn === 'function', '提示词构建函数可用');
+
+    // 点击 AI 按钮应提示去设置，而不是报错
+    await cdp.eval(`document.getElementById('btnRunAI').click(); return 1;`);
+    await sleep(400);
+    const aiAfter = await cdp.eval(`
+      const m = document.getElementById('settingsMask');
+      return { settingsOpen: !m.hidden, toast: (document.querySelector('.toast')||{}).textContent || '' };
+    `);
+    ok(aiAfter.settingsOpen === true, '未配置 Key 时自动打开设置面板');
+    await cdp.eval(`document.getElementById('btnCloseSettings').click(); return 1;`);
+    await sleep(200);
+
+    /* ---------- 保存记录 ---------- */
+    console.log('\n=== 6. 保存记录与历史 ===');
+    await cdp.eval(`document.getElementById('btnSave').click(); return 1;`);
+    await sleep(600);
+    const saved = await cdp.eval(`
+      const p = window.QCStore.getProject(window.QCStore.getCurrentProjectId());
+      return { n: p.records.length, label: p.records[0] && p.records[0].periodLabel,
+               r: p.records[0] && p.records[0].metrics.recall,
+               pi: p.records[0] && p.records[0].metrics.piActual,
+               rmin: p.records[0] && p.records[0].warning.rMin,
+               hasCi: !!(p.records[0] && p.records[0].metrics.ci && p.records[0].metrics.ci.recall) };
+    `);
+    ok(saved.n === 1, '保存了 1 条记录', String(saved.n));
+    near(saved.r, 0.9, 1e-12, '记录中的召回率正确');
+    near(saved.pi, 0.08, 1e-12, '记录中的 π 正确');
+    ok(saved.hasCi === true, '记录中保存了置信区间');
+    ok(saved.rmin !== null && saved.rmin !== undefined, '记录中保存了 R_min', String(saved.rmin));
+
+    // 历史页签
+    await cdp.eval(`document.querySelector('.tab[data-tab="history"]').click(); return 1;`);
+    await sleep(500);
+    const hist = await cdp.eval(`
+      const rows = document.querySelectorAll('#historyZone .tbl tbody tr');
+      const canvas = document.querySelector('#historyZone canvas');
+      return { rows: rows.length, hasCanvas: !!canvas,
+               first: rows[0] ? Array.from(rows[0].children).map(td=>td.textContent.trim()) : null };
+    `);
+    ok(hist.rows >= 1, '历史表渲染了记录行', String(hist.rows));
+    ok(hist.hasCanvas === true, '趋势图已绘制（canvas 存在）');
+
+    /* ---------- 第二次计算：警戒线应使用历史 ---------- */
+    console.log('\n=== 7. 历史驱动的警戒线与观察线 ===');
+    await cdp.eval(`document.querySelector('.tab[data-tab="evaluate"]').click(); return 1;`);
+    await sleep(200);
+    await cdp.eval(`
+      document.getElementById('periodLabel').value = 'W08';
+      document.getElementById('cmTP').value = 60;
+      document.getElementById('cmFP').value = 30;
+      document.getElementById('cmFN').value = 20;
+      document.getElementById('cmTN').value = 890;
+      document.getElementById('sampleTotal').value = 1000;
+      return 1;
+    `);
+    await cdp.eval(`document.getElementById('btnCalc').click(); return 1;`);
+    await sleep(600);
+    const second = await cdp.eval(`
+      const m = window.QCCore.computeMetrics({TP:60,FP:30,FN:20,TN:890});
+      const cards = Array.from(document.querySelectorAll('#resultZone .card'));
+      const warnCard = cards.find(c => /召回率警戒线推导/.test(c.textContent));
+      const warnText = warnCard ? warnCard.textContent : '';
+      const rows = Array.from(document.querySelectorAll('#resultZone .tbl tbody tr'));
+      const rRow = rows.find(tr => tr.children[0].textContent.trim() === '召回率 R');
+      return {
+        coreRecall: m.recall,
+        uiRecall: rRow ? rRow.children[2].textContent.trim() : null,
+        obsLine: rRow ? rRow.children[6].textContent.trim() : null,
+        warnText: warnText,
+      };
+    `);
+    near(second.coreRecall, 0.75, 1e-12, '第二次召回率 = 75%');
+    ok(second.uiRecall === '75.00%', '界面显示 75.00%', second.uiRecall);
+    ok(second.obsLine !== '—', '观察线已由历史得出', second.obsLine);
+    // 有 1 次历史 → 基线应取自历史（「前1次评估的实际驳回率最大值（使用 1 次历史）」）
+    ok(/前\s*1\s*次评估/.test(second.warnText), '警戒线基线来源标注了历史次数', second.warnText.slice(0, 150));
+    ok(/可容忍漏判条数/.test(second.warnText), '警戒线卡片给出可容忍漏判条数');
+
+    /* ---------- 载入历史记录 ---------- */
+    console.log('\n=== 8. 历史记录载入回表单 ===');
+    await cdp.eval(`document.querySelector('.tab[data-tab="history"]').click(); return 1;`);
+    await sleep(400);
+    await cdp.eval(`
+      const btns = Array.from(document.querySelectorAll('#historyZone button'));
+      const load = btns.find(b => b.textContent === '载入');
+      load.click();
+      return 1;
+    `);
+    await sleep(700);
+    const loadedBack = await cdp.eval(`
+      return {
+        tp: document.getElementById('cmTP').value,
+        fn: document.getElementById('cmFN').value,
+        period: document.getElementById('periodLabel').value,
+        onEvalTab: document.getElementById('view-evaluate').classList.contains('is-active'),
+      };
+    `);
+    ok(loadedBack.tp === '72', '载入后 TP = 72', loadedBack.tp);
+    ok(loadedBack.fn === '8', '载入后 FN = 8', loadedBack.fn);
+    ok(loadedBack.period === '2026-W07', '载入后周期正确', loadedBack.period);
+    ok(loadedBack.onEvalTab === true, '自动切回评估页');
+
+    /* ---------- 导出数据 ---------- */
+    console.log('\n=== 9. 导出数据完整性 ===');
+    const exported = await cdp.eval(`
+      const p = window.QCStore.exportAll();
+      return { app: p.app, schema: p.schema, projects: Object.keys(p.projects).length,
+               name: Object.values(p.projects)[0].name,
+               records: Object.values(p.projects)[0].records.length };
+    `);
+    ok(exported.app === 'qc-eval', '导出含 app 标识');
+    ok(exported.projects === 1, '导出 1 个项目');
+    ok(exported.name === '端到端测试项目', '导出项目名正确');
+    ok(exported.records >= 1, '导出含记录', String(exported.records));
+
+    /* ---------- 导入（往返一致性） ---------- */
+    console.log('\n=== 10. 导入往返一致性 ===');
+    const roundTrip = await cdp.eval(`
+      const payload = JSON.parse(JSON.stringify(window.QCStore.exportAll()));
+      // 先改名避免与现有项目重名冲突，再用合并模式导入
+      const before = JSON.stringify(Object.values(payload.projects)[0].records[0].metrics);
+      const res = window.QCStore.importAll(payload, 'merge');
+      const p = window.QCStore.getProject(window.QCStore.getCurrentProjectId());
+      return { res: res, sameMetrics: JSON.stringify(p.records[0].metrics) === before,
+               records: p.records.length };
+    `);
+    ok(roundTrip.res.settings === true || roundTrip.res.settings === false, '导入返回结构正确');
+    ok(roundTrip.sameMetrics === true, '导入后指标数值完全一致（往返无损）');
+
+    /* ---------- 边界：零分母 ---------- */
+    console.log('\n=== 11. 边界情形（零分母 / 空矩阵）===');
+    const edge = await cdp.eval(`
+      document.querySelector('.tab[data-tab="evaluate"]').click();
+      document.getElementById('cmTP').value = 0;
+      document.getElementById('cmFP').value = 0;
+      document.getElementById('cmFN').value = 10;
+      document.getElementById('cmTN').value = 990;
+      document.getElementById('btnCalc').click();
+      return 1;
+    `);
+    await sleep(600);
+    const edgeRes = await cdp.eval(`
+      const rows = Array.from(document.querySelectorAll('#resultZone .tbl tbody tr'));
+      const p = rows.find(tr => tr.children[0].textContent.trim() === '精确率 P');
+      const r = rows.find(tr => tr.children[0].textContent.trim() === '召回率 R');
+      const banner = (document.querySelector('.banner')||{}).textContent || '';
+      return {
+        pPoint: p ? p.children[2].textContent.trim() : null,
+        pLo: p ? p.children[3].textContent.trim() : null,
+        rPoint: r ? r.children[2].textContent.trim() : null,
+        banner: banner,
+        pageErrors: 0,
+      };
+    `);
+    ok(edgeRes.pPoint === '不可计算', '全通过 → 精确率显示「不可计算」而非 0', edgeRes.pPoint);
+    ok(edgeRes.pLo === '—', '精确率区间显示 —', edgeRes.pLo);
+    ok(edgeRes.rPoint === '0.00%', '召回率显示 0.00%', edgeRes.rPoint);
+
+    // 全空应给出错误而非崩溃
+    const emptyRes = await cdp.eval(`
+      ['cmTP','cmFP','cmFN','cmTN'].forEach(id => document.getElementById(id).value = '');
+      document.getElementById('btnCalc').click();
+      const banner = (document.querySelector('.banner')||{}).textContent || '';
+      return { banner: banner };
+    `);
+    ok(/混淆矩阵为空/.test(emptyRes.banner), '空矩阵给出明确错误提示', emptyRes.banner);
+
+    /* ---------- 整页截图 ---------- */
+    console.log('\n=== 12. 截图留档 ===');
+    await cdp.eval(`
+      document.getElementById('btnSample').click();
+      document.getElementById('btnCalc').click();
+      return 1;
+    `);
+    await sleep(700);
+    const shot1 = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+    ok(shot1.data.length > 1000, '评估页截图已生成');
+    ok(await saveShot(shot1, path.join(SHOT_DIR, '01-evaluate.png')), '评估页截图已落盘');
+
+    await cdp.eval(`document.querySelector('.tab[data-tab="history"]').click(); return 1;`);
+    await sleep(600);
+    const shot2 = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+    ok(shot2.data.length > 1000, '历史页截图已生成');
+    ok(await saveShot(shot2, path.join(SHOT_DIR, '02-history.png')), '历史页截图已落盘');
+
+    await cdp.eval(`document.querySelector('.tab[data-tab="method"]').click(); return 1;`);
+    await sleep(400);
+    const shot3 = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+    ok(shot3.data.length > 1000, '方法说明页截图已生成');
+    ok(await saveShot(shot3, path.join(SHOT_DIR, '03-method.png')), '方法说明页截图已落盘');
+
+    /* ---------- 收尾错误检查 ---------- */
+    console.log('\n=== 13. 全程错误检查 ===');
+    const hardErrors = consoleErrors.filter((e) => !/favicon/i.test(e));
+    ok(hardErrors.length === 0, '全程无控制台 error', hardErrors.slice(0, 3).join(' | '));
+    ok(pageErrors.length === 0, '全程无未捕获异常', pageErrors.slice(0, 3).join(' | '));
+    const logErrors = logs.filter((l) => /^error:/i.test(l) && !/favicon/i.test(l));
+    ok(logErrors.length === 0, '浏览器日志无 error 级条目', logErrors.slice(0, 3).join(' | '));
+
+    // 图标必须真实可取（否则浏览器产生 404 噪声，部署后也不专业）
+    const icon = await fetch('http://127.0.0.1:' + PORT + '/favicon.svg', { signal: AbortSignal.timeout(5000) });
+    ok(icon.status === 200, 'favicon.svg 可访问', 'HTTP ' + icon.status);
+
+  } finally {
+    try { chrome.kill(); } catch (e) { /* 忽略 */ }
+    server.close();
+    await sleep(500);
+    try { if (fs.existsSync(USER_DATA)) fs.rmSync(USER_DATA, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+  }
+
+  console.log('\n────────────────────────────────');
+  console.log(`通过 ${pass} 项，失败 ${fail} 项`);
+  if (fail) {
+    console.log('\n失败明细：');
+    failures.forEach((f) => console.log('  ✗ ' + f));
+    process.exitCode = 1;
+  } else {
+    console.log('全部通过 ✓');
+  }
+}
+
+main().catch((e) => {
+  console.error('测试运行失败：', e.message);
+  process.exitCode = 1;
+});

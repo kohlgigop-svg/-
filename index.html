@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>质检人员质量评估 · 指标与置信区间工具</title>
+<meta name="description" content="面向数据标注项目的质检质量评估工具：混淆矩阵指标、Wilson/Bootstrap 置信区间、警戒线与观察线、AI 辅助根因分析。">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">QC</span>
+    <div class="brand-text">
+      <strong>质检人员质量评估</strong>
+      <small>指标 · 置信区间 · 警戒线 · 观察线</small>
+    </div>
+  </div>
+
+  <div class="topbar-mid">
+    <label class="field inline">
+      <span>项目</span>
+      <select id="projectSelect"></select>
+    </label>
+    <button class="btn btn-ghost" id="btnNewProject" type="button">新建项目</button>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab is-active" data-tab="evaluate" type="button">评估</button>
+    <button class="tab" data-tab="history" type="button">历史</button>
+    <button class="tab" data-tab="method" type="button">方法说明</button>
+  </nav>
+
+  <div class="topbar-right">
+    <span class="storage-note" id="storageNote"></span>
+    <button class="btn btn-ghost" id="btnData" type="button">数据</button>
+    <button class="btn btn-ghost" id="btnSettings" type="button">设置</button>
+  </div>
+</header>
+
+<div class="banner-zone" id="bannerZone"></div>
+
+<main class="wrap">
+
+  <!-- ================= 评估 ================= -->
+  <section class="panel-view is-active" id="view-evaluate">
+    <div class="grid">
+
+      <!-- 左：录入 -->
+      <div class="col-input">
+        <div class="card">
+          <div class="card-head">
+            <h2>录入数据</h2>
+            <button class="btn btn-mini" id="btnSample" type="button">填入示例</button>
+          </div>
+
+          <div class="form-row">
+            <label class="field">
+              <span>评估周期</span>
+              <input type="text" id="periodLabel" placeholder="如 2025-W03 或 3月第一批">
+            </label>
+            <label class="field">
+              <span>质检人员（仅记录用）</span>
+              <input type="text" id="inspector" placeholder="可留空">
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label class="field">
+              <span>总体样本量<em>本项目数据总量</em></span>
+              <input type="number" id="populationTotal" min="0" step="1" placeholder="如 100000">
+            </label>
+            <label class="field">
+              <span>本次抽样量</span>
+              <input type="number" id="sampleTotal" min="0" step="1" placeholder="如 1000">
+            </label>
+          </div>
+
+          <div class="subhead">
+            <h3>混淆矩阵</h3>
+            <p class="hint">正例 = 驳回（坏数据）；负例 = 通过（好数据）。四个格子相加应等于本次抽样量。</p>
+          </div>
+
+          <div class="cm-grid">
+            <div class="cm-corner"><span>质检判定 ↓ / 标准 →</span></div>
+            <div class="cm-head">实际应驳回（正例）</div>
+            <div class="cm-head">实际应通过（负例）</div>
+
+            <div class="cm-rowhead">质检判为驳回</div>
+            <div class="cm-cell ok">
+              <label>TP · 正确驳回</label>
+              <input type="number" id="cmTP" min="0" step="1" placeholder="0">
+            </div>
+            <div class="cm-cell bad">
+              <label>FP · 误驳回</label>
+              <input type="number" id="cmFP" min="0" step="1" placeholder="0">
+            </div>
+
+            <div class="cm-rowhead">质检判为通过</div>
+            <div class="cm-cell bad">
+              <label>FN · 错误通过（漏判）</label>
+              <input type="number" id="cmFN" min="0" step="1" placeholder="0">
+            </div>
+            <div class="cm-cell ok">
+              <label>TN · 正确通过</label>
+              <input type="number" id="cmTN" min="0" step="1" placeholder="0">
+            </div>
+          </div>
+          <p class="cm-sum" id="cmSumNote"></p>
+
+          <details class="strata-block">
+            <summary>分层抽样设置（可选）</summary>
+            <p class="hint">
+              填写各层的「总体数」与「抽样数」，用于计算有效样本量并标注设计效应。
+              不填则按简单随机抽样处理。
+              <strong>注意：</strong>混淆矩阵仍填抽样内的真实计数，不需加权。
+            </p>
+            <div class="strata-row">
+              <label class="field">
+                <span>驳回层 · 总体数</span>
+                <input type="number" id="strataPosPop" min="0" step="1" placeholder="如 1000">
+              </label>
+              <label class="field">
+                <span>驳回层 · 抽样数</span>
+                <input type="number" id="strataPosSample" min="0" step="1" placeholder="如 400">
+              </label>
+            </div>
+            <div class="strata-row">
+              <label class="field">
+                <span>通过层 · 总体数</span>
+                <input type="number" id="strataNegPop" min="0" step="1" placeholder="如 99000">
+              </label>
+              <label class="field">
+                <span>通过层 · 抽样数</span>
+                <input type="number" id="strataNegSample" min="0" step="1" placeholder="如 600">
+              </label>
+            </div>
+          </details>
+
+          <div class="subhead">
+            <h3>阈值参数</h3>
+          </div>
+          <div class="form-row">
+            <label class="field">
+              <span>验收准确率要求<em>需求方给出</em></span>
+              <input type="number" id="acceptAccuracy" min="0.5" max="0.9999" step="0.001" placeholder="0.95">
+            </label>
+            <label class="field">
+              <span>观察线窗口 k</span>
+              <input type="number" id="obsWindow" min="1" max="20" step="1" placeholder="3">
+            </label>
+          </div>
+
+          <div class="actions">
+            <button class="btn btn-primary" id="btnCalc" type="button">计算</button>
+            <button class="btn" id="btnSave" type="button" disabled>保存为记录</button>
+            <button class="btn btn-ghost" id="btnReset" type="button">清空</button>
+          </div>
+          <p class="hint tiny" id="calcHint"></p>
+        </div>
+      </div>
+
+      <!-- 右：结果 -->
+      <div class="col-result">
+        <div id="resultZone">
+          <div class="card placeholder" id="placeholderCard">
+            <h2>还没有结果</h2>
+            <p>左侧填入抽样量与混淆矩阵后点击「计算」。工具会自动完成：</p>
+            <ul class="plain">
+              <li>指标点估计 + 95% 置信区间（比例型用 Wilson，F 族用参数 Bootstrap）</li>
+              <li>召回率警戒线推导（基线 B → 容忍率 T → R_min → 可容忍漏判条数）</li>
+              <li>各指标观察线（前 k 次中位数）与连续偏离提示</li>
+              <li>结构层 / 行为层 / 可靠性层三层预判诊断</li>
+              <li>AI 辅助的根因分析与动作建议（需先在「设置」中配置 API Key）</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ================= 历史 ================= -->
+  <section class="panel-view" id="view-history">
+    <div class="card">
+      <div class="card-head">
+        <h2>历史记录 · <span id="historyProjectName"></span></h2>
+        <div class="head-actions">
+          <button class="btn btn-mini" id="btnExportProject" type="button">导出本项目</button>
+          <button class="btn btn-mini btn-danger" id="btnClearHistory" type="button">清空记录</button>
+        </div>
+      </div>
+      <div id="historyZone"></div>
+    </div>
+  </section>
+
+  <!-- ================= 方法说明 ================= -->
+  <section class="panel-view" id="view-method">
+    <div class="card method">
+      <h2>方法说明</h2>
+      <p class="hint">本页说明工具内部使用的全部计算口径，便于审计与复核。所有公式均经单元测试验证。</p>
+
+      <h3>1. 方向约定</h3>
+      <p><strong>正例 = 驳回（坏数据）</strong>，负例 = 通过（好数据）。所有指标以此为前提，换方向会使召回率与精确率的含义互换。</p>
+
+      <h3>2. 指标定义</h3>
+      <table class="tbl">
+        <thead><tr><th>指标</th><th>公式</th><th>分母</th><th>管什么</th></tr></thead>
+        <tbody>
+          <tr><td>准确率 Acc</td><td>(TP+TN)/N</td><td>抽样总数</td><td>整体协调性，π 偏离均衡时被稀释，不作主指标</td></tr>
+          <tr><td>精确率 P</td><td>TP/(TP+FP)</td><td>质检驳回数</td><td>驳得准不准（受 π 稀释）</td></tr>
+          <tr><td>召回率 R</td><td>TP/(TP+FN)</td><td>实际应驳回数</td><td>漏没漏（关联不可逆风险）</td></tr>
+          <tr><td>特异度 Spec</td><td>TN/(TN+FP)</td><td>实际合格数</td><td>冤没冤（衡量误判只能用这个）</td></tr>
+          <tr><td>Fβ</td><td>(1+β²)·P·R / (β²·P + R)</td><td>—</td><td>P、R 的加权调和平均，权重比 = β²</td></tr>
+        </tbody>
+      </table>
+      <p class="hint"><strong>β 的权重关系：</strong>β=2 表示召回率权重是精确率的 <strong>4 倍</strong>（β²），不是 2 倍。β=1 退化为 F1。</p>
+
+      <h3>3. 置信区间</h3>
+      <ul class="plain">
+        <li><strong>比例型指标（Acc / P / R / Spec / NPV）用 Wilson 区间</strong>，不用 Wald。Wald 在 n=100、k=0 时给出 [0, 0]，等于宣称漏判率精确为 0；Wilson 给出 [0, 3.7%]，才反映真实不确定性。</li>
+        <li><strong>F 族指标用参数 Bootstrap</strong>（默认 B=4000）。F1 是 P 与 R 的非线性组合且二者由同一个 TP 决定（负相关），分别求区间再代入会丢掉相关性。</li>
+        <li>随机数使用固定种子，同一份数据每次得到完全一致的区间，保证可复核。</li>
+        <li><strong>n 是各指标自己的分母</strong>，不是抽样总量。同一个抽样集合里，P 与 R 的 n 可能相差一个数量级。</li>
+      </ul>
+
+      <h3>4. 警戒线（只对召回率设置）</h3>
+      <ol class="plain">
+        <li>基线 <strong>B</strong> = 前三次评估的实际驳回率中的最高值（不足三次则取全部；无历史则取本次）</li>
+        <li>容忍率 <strong>T</strong> = 1 − 需求方要求的验收准确率</li>
+        <li>召回率下限 <strong>R_min</strong> = 1 − T/B；若 R_min ≤ 0（即 B ≤ T），退化为历史最差召回率</li>
+        <li>可容忍漏判条数 = max(1, 实际应驳回数 × (1 − R_min))</li>
+      </ol>
+      <p class="hint">
+        判定用<strong>区间下限</strong>：区间下限 ≥ R_min 判为达标；区间跨越 R_min 判为不确定（不作结论）；区间上限低于 R_min 判为确证问题。
+        只对召回率设绝对警戒线，因为漏判通常不可逆；精确率属返修成本，只在效率维度作相对比较。
+      </p>
+
+      <h3>5. 观察线</h3>
+      <ul class="plain">
+        <li>各指标取前 k 次统计的中位数（k 默认 3，可在输入区调整）</li>
+        <li>不足 k 次时取现有全部值的中位数，并标注稳健性有限</li>
+        <li>连续两次低于观察线才提示纳入观察，单次低于不作结论</li>
+      </ul>
+
+      <h3>6. 三态判定（信号与噪声）</h3>
+      <table class="tbl">
+        <thead><tr><th>区间位置</th><th>判定</th><th>动作</th></tr></thead>
+        <tbody>
+          <tr><td>下限已高于警戒线</td><td>未见实质问题</td><td>不动作，不进入复盘</td></tr>
+          <tr><td>跨越警戒线</td><td>不确定</td><td>增大样本量后再判，本次不作结论</td></tr>
+          <tr><td>上限已低于警戒线</td><td>确证问题</td><td>进入复盘，做错误归因</td></tr>
+        </tbody>
+      </table>
+
+      <h3>7. 分层抽样</h3>
+      <ul class="plain">
+        <li>点估计仍用抽样内的真实计数：P、R、F1 等为比值，加权前后取值相同</li>
+        <li>有效样本量（经典口径）n_eff = (Σw)² / Σw²，w = 1/入样概率；同时给出计入有限总体校正 (1−f) 的口径</li>
+        <li>过采样「已驳回层」可提高该层精度，但总体层面的有效信息量会被折算，报告时应同时给出有效样本量</li>
+      </ul>
+
+      <h3>8. 本工具的边界</h3>
+      <ul class="plain">
+        <li>指标体系回答「哪里可能有问题」，不回答「这个人行不行」</li>
+        <li>样本量不足（区间过宽）时禁止作任何评价；工具会在诊断卡中明确提示</li>
+        <li>不适用多分类质检（通过/驳回/返修），需扩展为宏平均或微平均</li>
+        <li>指标与个人奖惩直接挂钩会诱发指标操纵（压低驳回量即可让 P 好看），且把风险转移给下游</li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<!-- ================= 设置弹窗 ================= -->
+<div class="modal-mask" id="settingsMask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-head">
+      <h2 id="settingsTitle">设置</h2>
+      <button class="icon-btn" id="btnCloseSettings" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <label class="field">
+        <span>API Key<em>仅保存在本机浏览器，不会写入代码或上传</em></span>
+        <div class="row-inline">
+          <input type="password" id="setApiKey" placeholder="sk-..." autocomplete="off">
+          <button class="btn btn-mini" id="btnToggleKey" type="button">显示</button>
+        </div>
+      </label>
+      <div class="row-inline gap">
+        <button class="btn btn-mini" id="btnTestKey" type="button">测试连接</button>
+        <span class="hint tiny" id="keyTestResult"></span>
+      </div>
+
+      <div class="form-row">
+        <label class="field">
+          <span>模型</span>
+          <select id="setModel">
+            <option value="deepseek-flash">deepseek-flash（快，推荐）</option>
+            <option value="deepseek-v4-pro">deepseek-v4-pro（更强，较慢）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>接口地址</span>
+          <input type="text" id="setApiBase" placeholder="https://api.deepseek.com">
+        </label>
+      </div>
+
+      <div class="form-row">
+        <label class="field">
+          <span>Bootstrap 次数</span>
+          <input type="number" id="setBootstrapB" min="500" max="20000" step="500">
+        </label>
+        <label class="field">
+          <span>置信水平</span>
+          <select id="setAlpha">
+            <option value="0.05">95%</option>
+            <option value="0.10">90%</option>
+            <option value="0.01">99%</option>
+          </select>
+        </label>
+      </div>
+
+      <p class="hint">
+        说明：工具为纯前端页面，API Key 存于本机 localStorage。请勿在公用电脑上保存 Key。
+        若在公开网络使用，建议改用服务端代理方式。
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="btnSettingsCancel" type="button">取消</button>
+      <button class="btn btn-primary" id="btnSettingsSave" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 数据管理弹窗 ================= -->
+<div class="modal-mask" id="dataMask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dataTitle">
+    <div class="modal-head">
+      <h2 id="dataTitle">数据管理</h2>
+      <button class="icon-btn" id="btnCloseData" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="hint">数据保存在本机浏览器中。清理浏览器数据会一并删除，请定期导出备份。</p>
+      <div class="row-inline gap">
+        <button class="btn" id="btnExportAll" type="button">导出全部（含设置）</button>
+        <button class="btn" id="btnImport" type="button">导入数据</button>
+        <input type="file" id="importFile" accept="application/json,.json" hidden>
+      </div>
+      <div class="subhead"><h3>项目</h3></div>
+      <div id="projectAdminZone"></div>
+      <p class="hint tiny" id="sizeNote"></p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="btnDataClose" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-zone" id="toastZone"></div>
+
+<script src="src/core.js"></script>
+<script src="src/store.js"></script>
+<script src="src/diagnostics.js"></script>
+<script src="src/ai.js"></script>
+<script src="src/app.js"></script>
+</body>
+</html>

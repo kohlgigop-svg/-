@@ -1,0 +1,21 @@
+# 依赖与构建产物（本项目无依赖，仅用于本地测试）
+node_modules/
+package-lock.json
+
+# 测试临时产物
+test/.chrome-profile/
+test/.chrome-render/
+test/.chrome-probe/
+test/_chrome_err.txt
+test/_chrome_out.txt
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地数据导出（可能含 API Key，禁止提交）
+qc-eval-backup-*.json
+qc-eval-*.json
