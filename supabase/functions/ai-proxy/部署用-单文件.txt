@@ -4,11 +4,16 @@
 // 部署：Supabase → Edge Functions → Deploy a new function → Via Editor
 //       函数名必须填：ai-proxy
 //       全文粘贴本文件 → Deploy
-// 然后到 Edge Functions → Secrets 添加四个变量：
-//   DEEPSEEK_API_KEY   = sk-开头的真实 Key
-//   ACCESS_CODE_HASH   = 2b3ac575436c0f15e2eae20a595c9b868fe47c3e0bd5c9228a870adbcf8af5d1
-//   SUPABASE_URL       = https://ofdtgchdkhgvksuohzoq.supabase.co
-//   SUPABASE_ANON_KEY  = 你的 anon public key
+//
+// 然后到 Edge Functions → Secrets 添加四个变量（名称必须完全一致）：
+//   DEEPSEEK_API_KEY       = sk-开头的真实 Key
+//   ACCESS_CODE_HASH       = 2b3ac575436c0f15e2eae20a595c9b868fe47c3e0bd5c9228a870adbcf8af5d1
+//   APP_SUPABASE_URL       = https://ofdtgchdkhgvksuohzoq.supabase.co
+//   APP_SUPABASE_ANON_KEY  = 你的 anon public key
+//
+// 注意：自定义 Secret 不能用 SUPABASE_ 开头——Supabase 保留该前缀，会报
+//       "Name must not start with the SUPABASE_ prefix"。故本项目用 APP_ 前缀。
+//       （平台自动注入的 SUPABASE_URL / SUPABASE_ANON_KEY 也会被自动兼容使用）
 //
 // 本文件由 supabase/functions/ai-proxy/ 下的 handler.js 与 index.ts 合并生成，
 // 逻辑与仓库中带测试的版本完全一致。
@@ -73,7 +78,9 @@ function json(body, status, cors) {
 /**
  * 处理一次 AI 代理请求
  * @param {Request} req
- * @param {object} env { DEEPSEEK_API_KEY, ACCESS_CODE_HASH, SUPABASE_URL, SUPABASE_ANON_KEY, DEEPSEEK_BASE }
+ * @param {object} env 环境变量。注意 Supabase 禁止自定义 SUPABASE_ 前缀的 Secret，
+ *                     因此本项目用 APP_SUPABASE_* ；若 Supabase 自动注入了
+ *                     SUPABASE_URL / SUPABASE_ANON_KEY，也会自动兼容使用。
  * @param {function} fetchImpl 便于测试注入
  */
 async function handleRequest(req, env, fetchImpl) {
@@ -124,8 +131,10 @@ async function handleRequest(req, env, fetchImpl) {
   }
 
   // ---------- 4. 会话校验（提高滥用门槛：必须带有效的 Supabase 会话） ----------
-  const supabaseUrl = (env.SUPABASE_URL || '').replace(/\/+$/, '');
-  const anonKey = env.SUPABASE_ANON_KEY || '';
+  // 变量名优先用 APP_SUPABASE_*（Supabase 禁止自定义 SUPABASE_ 前缀的 Secret），
+  // 同时兼容自动注入的 SUPABASE_URL / SUPABASE_ANON_KEY。
+  const supabaseUrl = String(env.APP_SUPABASE_URL || env.SUPABASE_URL || '').replace(/\/+$/, '');
+  const anonKey = env.APP_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY || '';
   const auth = req.headers.get('authorization') || '';
   const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
   if (supabaseUrl && anonKey) {
@@ -199,6 +208,10 @@ Deno.serve(async (req) => {
   return await handleRequest(req, {
     DEEPSEEK_API_KEY: Deno.env.get('DEEPSEEK_API_KEY'),
     ACCESS_CODE_HASH: Deno.env.get('ACCESS_CODE_HASH'),
+    // 优先取 APP_ 前缀（自定义 Secret 不能用 SUPABASE_ 前缀），
+    // 同时兼容平台自动注入的 SUPABASE_* 变量
+    APP_SUPABASE_URL: Deno.env.get('APP_SUPABASE_URL'),
+    APP_SUPABASE_ANON_KEY: Deno.env.get('APP_SUPABASE_ANON_KEY'),
     SUPABASE_URL: Deno.env.get('SUPABASE_URL'),
     SUPABASE_ANON_KEY: Deno.env.get('SUPABASE_ANON_KEY'),
     DEEPSEEK_BASE: Deno.env.get('DEEPSEEK_BASE') || 'https://api.deepseek.com',

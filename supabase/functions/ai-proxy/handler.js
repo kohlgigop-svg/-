@@ -58,7 +58,9 @@ function json(body, status, cors) {
 /**
  * 处理一次 AI 代理请求
  * @param {Request} req
- * @param {object} env { DEEPSEEK_API_KEY, ACCESS_CODE_HASH, SUPABASE_URL, SUPABASE_ANON_KEY, DEEPSEEK_BASE }
+ * @param {object} env 环境变量。注意 Supabase 禁止自定义 SUPABASE_ 前缀的 Secret，
+ *                     因此本项目用 APP_SUPABASE_* ；若 Supabase 自动注入了
+ *                     SUPABASE_URL / SUPABASE_ANON_KEY，也会自动兼容使用。
  * @param {function} fetchImpl 便于测试注入
  */
 export async function handleRequest(req, env, fetchImpl) {
@@ -109,8 +111,10 @@ export async function handleRequest(req, env, fetchImpl) {
   }
 
   // ---------- 4. 会话校验（提高滥用门槛：必须带有效的 Supabase 会话） ----------
-  const supabaseUrl = (env.SUPABASE_URL || '').replace(/\/+$/, '');
-  const anonKey = env.SUPABASE_ANON_KEY || '';
+  // 变量名优先用 APP_SUPABASE_*（Supabase 禁止自定义 SUPABASE_ 前缀的 Secret），
+  // 同时兼容自动注入的 SUPABASE_URL / SUPABASE_ANON_KEY。
+  const supabaseUrl = String(env.APP_SUPABASE_URL || env.SUPABASE_URL || '').replace(/\/+$/, '');
+  const anonKey = env.APP_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY || '';
   const auth = req.headers.get('authorization') || '';
   const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
   if (supabaseUrl && anonKey) {

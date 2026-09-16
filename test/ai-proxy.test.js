@@ -21,6 +21,13 @@ const REAL_KEY = 'sk-super-secret-do-not-leak-1234567890';
 const ENV = {
   DEEPSEEK_API_KEY: REAL_KEY,
   ACCESS_CODE_HASH: ACCESS_HASH,
+  APP_SUPABASE_URL: SB,
+  APP_SUPABASE_ANON_KEY: ANON,
+};
+// 备用环境：只提供平台自动注入的 SUPABASE_* 变量（验证兼容性）
+const ENV_PLATFORM_INJECTED = {
+  DEEPSEEK_API_KEY: REAL_KEY,
+  ACCESS_CODE_HASH: ACCESS_HASH,
   SUPABASE_URL: SB,
   SUPABASE_ANON_KEY: ANON,
 };
@@ -289,6 +296,42 @@ console.log('=== 9. 代理地址归一化（前端易错点）===');
   ok(CL.normalizeUrl('https://ofdtgchdkhgvksuohzoq.supabase.co/functions/v1/ai-proxy')
       === 'https://ofdtgchdkhgvksuohzoq.supabase.co',
     '对照：normalizeUrl 确实会截断路径（故代理地址必须用专用函数）');
+}
+
+console.log('=== 10. 环境变量命名兼容性（Supabase 保留 SUPABASE_ 前缀）===');
+{
+  // 回归背景：Supabase 禁止自定义 Secret 以 SUPABASE_ 开头，
+  // 因此本项目改用 APP_SUPABASE_*，同时兼容平台自动注入的 SUPABASE_*。
+  const f1 = makeFetch();
+  const r1 = await handleRequest(req(validBody), ENV, f1.impl);
+  ok(r1.status === 200, 'APP_ 前缀变量可用', 'HTTP ' + r1.status);
+  const authCall1 = f1.calls.find((c) => c.url.indexOf('/auth/v1/user') >= 0);
+  ok(!!authCall1 && authCall1.url.indexOf('test.supabase.co') >= 0,
+    'APP_ 前缀下会话校验指向正确地址', authCall1 ? authCall1.url : '(无调用)');
+
+  const f2 = makeFetch();
+  const r2 = await handleRequest(req(validBody), ENV_PLATFORM_INJECTED, f2.impl);
+  ok(r2.status === 200, '平台自动注入的 SUPABASE_* 变量同样可用（兼容）', 'HTTP ' + r2.status);
+  const authCall2 = f2.calls.find((c) => c.url.indexOf('/auth/v1/user') >= 0);
+  ok(!!authCall2, '兼容路径下仍执行了会话校验');
+
+  // APP_ 优先于 SUPABASE_
+  const f3 = makeFetch();
+  await handleRequest(req(validBody), Object.assign({}, ENV_PLATFORM_INJECTED, {
+    APP_SUPABASE_URL: 'https://app-wins.supabase.co', APP_SUPABASE_ANON_KEY: ANON,
+  }), f3.impl);
+  const authCall3 = f3.calls.find((c) => c.url.indexOf('/auth/v1/user') >= 0);
+  ok(!!authCall3 && authCall3.url.indexOf('app-wins.supabase.co') >= 0,
+    '同时存在时以 APP_ 前缀为准', authCall3 ? authCall3.url : '(无)');
+
+  // 两个都不提供时会话校验跳过（仍受访问码保护）
+  const f4 = makeFetch();
+  const r4 = await handleRequest(req(validBody), {
+    DEEPSEEK_API_KEY: REAL_KEY, ACCESS_CODE_HASH: ACCESS_HASH,
+  }, f4.impl);
+  ok(r4.status === 200, '未提供 Supabase 变量时仍可工作（降级为仅访问码校验）', 'HTTP ' + r4.status);
+  ok(f4.calls.filter((c) => c.url.indexOf('/auth/v1/user') >= 0).length === 0,
+    '未配置时不发起会话校验请求');
 }
 
 console.log('\n────────────────────────────────');

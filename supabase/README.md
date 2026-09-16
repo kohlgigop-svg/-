@@ -183,8 +183,16 @@ select public.qc_fetch_all('你的访问码');       -- 期望 []
 |---|---|
 | `DEEPSEEK_API_KEY` | `sk-` 开头的真实 Key |
 | `ACCESS_CODE_HASH` | `2b3ac575436c0f15e2eae20a595c9b868fe47c3e0bd5c9228a870adbcf8af5d1` |
-| `SUPABASE_URL` | `https://ofdtgchdkhgvksuohzoq.supabase.co` |
-| `SUPABASE_ANON_KEY` | 你的 anon public key |
+| `APP_SUPABASE_URL` | `https://ofdtgchdkhgvksuohzoq.supabase.co` |
+| `APP_SUPABASE_ANON_KEY` | 你的 anon public key |
+
+> ⚠️ **自定义 Secret 不能用 `SUPABASE_` 开头** —— Supabase 保留该前缀，会报
+> `Name must not start with the SUPABASE_ prefix`。所以本项目统一用 `APP_` 前缀。
+> （平台自动注入的 `SUPABASE_URL` / `SUPABASE_ANON_KEY` 会被函数自动兼容使用，
+> 因此即使你只配了上面两个 `APP_` 变量之外的，也仍然可用。）
+>
+> `ACCESS_CODE_HASH` 就是访问码 `qc-eval-2026` 的 SHA-256，与数据库里用的**是同一个哈希**。
+> 若你改过访问码，用同样的方法重新算（见文首说明）。
 
 > `ACCESS_CODE_HASH` 就是访问码 `qc-eval-2026` 的 SHA-256，与数据库里用的**是同一个哈希**。
 > 若你改过访问码，用同样的方法重新算（见文首说明）。
