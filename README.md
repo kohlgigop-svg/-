@@ -139,7 +139,7 @@ npx serve .
 node test/run-all.js
 ```
 
-测试分四层，共 **358 项断言**：
+测试分五层，共 **396 项断言**：
 
 | 套件 | 断言数 | 内容 |
 |---|---|---|
@@ -147,6 +147,7 @@ node test/run-all.js
 | `test/integration.test.js` | 87 | compute → 诊断 → AI 提示词全链路；三类根因识别；提示词纪律与事实完整性 |
 | `test/browser.e2e.js` | 66 | 真实 Chrome（CDP 驱动）：页面加载无异常、计算链路、诊断渲染、保存/载入、导出导入往返、边界情形、全程零控制台错误 |
 | `test/render.test.js` | 34 | 布局（宽屏双列/窄屏单列）、无横向溢出、表格数值与内核交叉核对、趋势图画布像素、**WCAG AA 文字对比度** |
+| `test/live.test.js` | 38 | 线上部署验收：资源与本地逐字节一致、HTTPS、刷新后数据留存、**从线上站点直连 DeepSeek 的 CORS 实测** |
 
 ---
 

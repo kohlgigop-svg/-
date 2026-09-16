@@ -19,3 +19,8 @@ desktop.ini
 # 本地数据导出（可能含 API Key，禁止提交）
 qc-eval-backup-*.json
 qc-eval-*.json
+
+# 本地临时脚本与产物（可能含凭据，禁止提交）
+_*.mjs
+_*.ps1
+_*.txt

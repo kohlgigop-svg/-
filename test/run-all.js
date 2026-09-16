@@ -8,6 +8,7 @@ const suites = [
   ['集成测试', 'integration.test.js'],
   ['浏览器端到端', 'browser.e2e.js'],
   ['渲染验证', 'render.test.js'],
+  ['线上部署验收', 'live.test.js'],
 ];
 
 let failed = 0;
