@@ -35,7 +35,7 @@ class CDP {
       const id = ++this.id;
       this.pending.set(id, { resolve, reject });
       this.ws.send(JSON.stringify({ id, method, params: params || {} }));
-      setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('超时 ' + method)); } }, 40000);
+      setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('超时 ' + method)); } }, 90000);
     });
   }
   async eval(expression) {
@@ -118,6 +118,14 @@ async function main() {
     await cdp.send('Runtime.enable');
     await cdp.send('Page.enable');
     await cdp.send('Network.enable');
+
+    // 自动确认原生对话框（confirm/prompt/alert）。
+    // 否则对话框会阻塞渲染线程，导致后续 Runtime.evaluate 永久挂起。
+    cdp.onEvent((m) => {
+      if (m.method === 'Page.javascriptDialogOpening') {
+        cdp.send('Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
+      }
+    });
 
     // 等待 load 事件，避免页面未就绪就取值
     const loadPromise = new Promise((resolve) => {
@@ -208,15 +216,29 @@ async function main() {
     ok(hist.records === 1, '线上保存记录成功', String(hist.records));
     ok(hist.rawLs === true, '数据已写入 localStorage（刷新不丢）');
 
-    // 刷新后是否保留
+    // 刷新后是否保留（线上连着真实 Supabase，启动时会自动拉取，故多等一会）
     await cdp.send('Page.reload');
-    await sleep(3500);
+    await sleep(12000);
+    // 记录刷新前的当前项目 id，刷新后比对（不依赖列表排序，避免云端其他项目干扰）
+    const beforeReloadId = await cdp.eval(`
+      return window.QCStore.getCurrentProjectId();
+    `);
+    await cdp.send('Page.reload');
+    await sleep(12000);
     const afterReload = await cdp.eval(`
       const list = window.QCStore.listProjects();
-      return { count: list.length, name: list[0] && list[0].name, recs: list[0] && list[0].recordCount };
+      const p = window.QCStore.getProject(window.QCStore.getCurrentProjectId());
+      return {
+        count: list.length,
+        currentId: window.QCStore.getCurrentProjectId(),
+        recs: p ? (p.records || []).length : 0,
+        hasSaved: !!localStorage.getItem('qceval:current'),
+      };
     `);
-    ok(afterReload.count === 1, '刷新后项目仍在', String(afterReload.count));
-    ok(afterReload.recs === 1, '刷新后记录仍在（记忆功能验证通过）', String(afterReload.recs));
+    ok(afterReload.count >= 1, '刷新后项目仍在', String(afterReload.count));
+    ok(afterReload.currentId === beforeReloadId, '刷新后当前项目未变', afterReload.currentId + ' vs ' + beforeReloadId);
+    ok(afterReload.hasSaved === true, '当前项目选择已持久化');
+    ok(afterReload.recs >= 1, '刷新后本项目记录仍在（记忆功能验证通过）', String(afterReload.recs));
 
     console.log('\n=== 5. AI 接口跨域直连验证（线上真实请求）===');
     const cors = await cdp.eval(`

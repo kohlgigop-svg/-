@@ -1136,6 +1136,11 @@
         if (p.id === cur) o.selected = true;
         sel.appendChild(o);
       });
+      // 主动持久化「当前项目」，避免仅依赖用户手动切换：
+      // 否则刷新后当前项目会退化为列表首项（顺序由更新时间决定），用户会莫名被切换项目。
+      if (cur && localStorage.getItem('qceval:current') !== cur) {
+        S.setCurrentProjectId(cur);
+      }
     }
     $('storageNote').textContent = S.isPersistent()
       ? '存储 ' + (S.storageSize() / 1024).toFixed(1) + ' KB · 本机'
