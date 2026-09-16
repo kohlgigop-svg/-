@@ -295,12 +295,63 @@ console.log('=== 12. AI 返回解析容错 ===');
   ok(noisy.summary === 'ok', '从噪声文本中截取 JSON');
 
   let threw = false;
-  try { AI.extractJSON('完全没有 JSON'); } catch (e) { threw = true; ok(/无法解析|未返回/.test(e.message), '错误信息可读'); }
+  try { AI.extractJSON('完全没有 JSON'); } catch (e) { threw = true; ok(/无法修复|无法解析|不是合法/.test(e.message), '错误信息可读'); }
   ok(threw, '无 JSON 时抛出可读错误');
 
   threw = false;
-  try { AI.extractJSON(''); } catch (e) { threw = true; }
+  try { AI.extractJSON(''); } catch (e) { threw = true; ok(/预算|空/.test(e.message), '空返回的错误提示指向预算问题', e.message); }
   ok(threw, '空返回时抛出错误');
+}
+
+console.log('=== 12b. 回归：输出被截断时的 JSON 修复（deepseek-flash 为推理模型）===');
+{
+  // 背景：该模型思维链与正文共用 max_tokens，预算不足会导致输出被截断。
+  // 曾因此报「JSON 无法解析」，此处固化为回归测试，确保不再直接失败。
+  const cases = [
+    ['截断在字符串中间', '{"summary":"这是一段没有结尾的话', '这是一段没有结尾的话'],
+    ['截断在数组元素之间', '{"summary":"s","actions":[{"priority":"P0","action":"a1"},{"priority":"P1","act', 's'],
+    ['截断在对象中间', '{"summary":"s","actions":[{"priority":"P0"', 's'],
+    ['数组被截断', '{"summary":"s","needsHuman":["第一项","第二', 's'],
+  ];
+  for (const [name, input, expect] of cases) {
+    let r = null, err = null;
+    try { r = AI.parseModelJSON(input); } catch (e) { err = e.message; }
+    ok(r !== null, name + ' 应能修复后解析', err || '');
+    if (r) {
+      ok(r.repaired === true, name + ' 标记为已修复');
+      ok(r.data.summary === expect, name + ' 抢救出 summary', String(r.data.summary));
+    }
+  }
+
+  // 尾随逗号与缺逗号
+  ok(AI.parseModelJSON('{"summary":"s","followUp":["a","b",],}').data.summary === 's', '修复尾随逗号');
+  ok(AI.parseModelJSON('{"summary":"s" "reliability":"r"}').data.summary === 's', '修复缺失逗号');
+
+  // rootCause 展平字段应被重组为对象（契约一致）
+  const flat = AI.parseModelJSON('{"summary":"s","structure":"a","behavior":"b","capability":"c"');
+  ok(flat.data.rootCause && flat.data.rootCause.structure === 'a', '展平的 structure/behavior/capability 重组为 rootCause');
+  ok(flat.data.structure === undefined, '重组后不残留展平键');
+
+  // 完全无结构时才失败
+  let threw = false;
+  try { AI.parseModelJSON('这里没有任何 JSON'); } catch (e) { threw = true; }
+  ok(threw, '完全无 JSON 结构时仍抛出错误');
+
+  // 合法 JSON 不应被标记为修复
+  const clean = AI.parseModelJSON('{"summary":"ok"}');
+  ok(clean.repaired === false, '合法 JSON 不触发修复路径');
+}
+
+console.log('=== 12c. 输出预算：推理模型必须给足 max_tokens ===');
+{
+  // 该模型 reasoning_tokens 与正文共用预算，实测同一输入思维链可达 4000~8700 token。
+  // 预算默认值若过小，会出现「思维链吃光预算 → 正文为空 → JSON 解析失败」。
+  ok(AI.DEFAULT_MAX_TOKENS >= 12000, '默认 max_tokens ≥ 12000', String(AI.DEFAULT_MAX_TOKENS));
+  ok(AI.MAX_MAX_TOKENS > AI.DEFAULT_MAX_TOKENS, '重试上限高于默认值');
+  const n = AI.buildUserPayload(computeChain({
+    input: { periodLabel: 'W', cm: { TP: 72, FP: 26, FN: 8, TN: 894 }, strata: [], acceptAccuracy: 0.95, obsWindow: 3 },
+  }).ctx).length;
+  ok(n < 20000, '提示词长度可控（字符）', String(n));
 }
 
 console.log('=== 13. 存档记录结构可被再次读取（模拟 store 记录 → 历史）===');

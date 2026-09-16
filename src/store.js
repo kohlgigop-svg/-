@@ -73,6 +73,8 @@
     apiKey: '',
     model: 'deepseek-flash',
     apiBase: 'https://api.deepseek.com',
+    // deepseek-flash 为推理模型，思维链与正文共用 max_tokens，故预算须留足余量
+    maxTokens: 16000,
     obsWindow: 3,          // 观察线窗口 k
     alpha: 0.05,           // 置信水平 → 1−alpha
     bootstrapB: 4000,      // Bootstrap 次数

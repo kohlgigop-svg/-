@@ -323,6 +323,15 @@
         </label>
       </div>
 
+      <label class="field">
+        <span>AI 输出预算 max_tokens<em>推理模型的思维链与正文共用此预算，过小会导致正文被截断</em></span>
+        <input type="number" id="setMaxTokens" min="2000" max="32000" step="1000">
+      </label>
+      <p class="hint tiny">
+        deepseek-flash 会先产出思维链（实测可达 4000+ token），这部分同样计入 max_tokens。
+        若出现「输出被截断」提示，请调高此值（建议 16000 以上）。
+      </p>
+
       <p class="hint">
         说明：工具为纯前端页面，API Key 存于本机 localStorage。请勿在公用电脑上保存 Key。
         若在公开网络使用，建议改用服务端代理方式。

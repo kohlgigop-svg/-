@@ -513,11 +513,24 @@
       st.appendChild(document.createTextNode(' 正在请求 ' + (settings.model || 'deepseek-flash') + ' …'));
     } else if (!settings.apiKey) {
       st.textContent = '未配置 API Key，点击右上角「设置」填入后即可使用。';
+    } else if (state.aiResult) {
+      const r = state.aiResult;
+      const bits = ['模型 ' + r.model,
+        '耗时 ' + (r.elapsedMs / 1000).toFixed(1) + ' s',
+        '预算 ' + r.maxTokens];
+      if (r.reasoningTokens !== null && r.reasoningTokens !== undefined) bits.push('思维链 ' + r.reasoningTokens + ' token');
+      if (r.usage && r.usage.total_tokens) bits.push('总 token ' + r.usage.total_tokens);
+      if (r.retried) bits.push('已因截断重试一次');
+      st.textContent = bits.join('　');
+      if (r.truncated) {
+        st.appendChild(document.createTextNode('　'));
+        st.appendChild(el('span', 'badge badge-alert', '输出被截断，内容可能不完整'));
+      } else if (r.repaired) {
+        st.appendChild(document.createTextNode('　'));
+        st.appendChild(el('span', 'badge badge-warn', 'JSON 已修复'));
+      }
     } else if (state.aiError) {
       st.textContent = '上次调用失败：' + state.aiError;
-    } else if (state.aiResult) {
-      st.textContent = '模型 ' + state.aiResult.model + '　耗时 ' + (state.aiResult.elapsedMs / 1000).toFixed(1) + ' s'
-        + (state.aiResult.usage ? '　tokens ' + (state.aiResult.usage.total_tokens || '—') : '');
     } else {
       st.textContent = '模型 ' + (settings.model || 'deepseek-flash') + '　将依据上方指标与诊断卡生成根因分析与动作建议。';
     }
@@ -1098,9 +1111,16 @@
         apiKey: settings.apiKey,
         model: settings.model,
         apiBase: settings.apiBase,
+        maxTokens: settings.maxTokens || 16000,
       });
       state.aiResult = res;
-      toast('分析已生成', 'ok');
+      if (res.truncated) {
+        toast('注意：模型输出达到长度上限，已尽力修复 JSON，内容可能不完整。可在「设置」中调高 max_tokens。', 'err');
+      } else if (res.repaired) {
+        toast('模型返回的 JSON 存在残缺，已自动修复后展示。', 'err');
+      } else {
+        toast('分析已生成', 'ok');
+      }
     } catch (e) {
       state.aiError = e.message;
       toast('AI 分析失败：' + e.message, 'err');
@@ -1134,6 +1154,7 @@
     $('setApiBase').value = s.apiBase || 'https://api.deepseek.com';
     $('setBootstrapB').value = s.bootstrapB || 4000;
     $('setAlpha').value = String(s.alpha || 0.05);
+    $('setMaxTokens').value = s.maxTokens || 16000;
     $('keyTestResult').textContent = '';
     $('settingsMask').hidden = false;
   }
@@ -1146,6 +1167,7 @@
       apiBase: $('setApiBase').value.trim() || 'https://api.deepseek.com',
       bootstrapB: Number($('setBootstrapB').value) || 4000,
       alpha: Number($('setAlpha').value) || 0.05,
+      maxTokens: Number($('setMaxTokens').value) || 16000,
     });
     toast('设置已保存', 'ok');
     closeSettings();

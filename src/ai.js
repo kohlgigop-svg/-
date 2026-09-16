@@ -10,6 +10,14 @@
   const C = global.QCCore;
 
   /* ---------------------------------------------------------------------------
+   * 输出预算
+   *   deepseek-flash 为推理模型：思维链（reasoning_tokens）与正文共用 max_tokens。
+   *   实测同一份输入，思维链可达 4000+ token，故预算必须留足余量。
+   * ------------------------------------------------------------------------ */
+  const DEFAULT_MAX_TOKENS = 16000;
+  const MAX_MAX_TOKENS = 32000;
+
+  /* ---------------------------------------------------------------------------
    * 系统提示词 —— 全文纪律固化处，修改需谨慎
    * ------------------------------------------------------------------------ */
 
@@ -42,8 +50,7 @@
     '   两者绝不能混在一条建议里处理。',
     'G. 实际驳回率 π 是项目结构量，不是质检成绩。解读精确率之前必须先看 π；π 偏低时精确率天然偏低，不得读成个人能力问题。',
     '',
-    '【输出格式】仅输出一个 JSON 对象，键名固定如下，全部值为中文字符串（数组元素也是字符串）：',
-    '{',
+    '【输出格式】仅输出一个 JSON 对象，键名固定如下，全部值为中文字符串（数组元素也是字符串）：',    '{',
     '  "summary": "一句话结论。若存在任何计算局限或样本不足，第一句必须先说明「本次数据的局限」再给结论。",',
     '  "reliability": "数据可信度评估：逐项说明哪些指标可信、哪些因样本量或区间过宽而不可信，并说明理由。",',
     '  "rootCause": {',
@@ -65,6 +72,12 @@
     '- followUp 2~4 条，needsHuman 1~4 条。',
     '- 优先引用输入中「工具预判诊断」已给出的结论，并在此基础上补充解读；若你认为某条预判不成立，必须说明理由。',
     '- 总字数控制在 900 字以内。',
+    '',
+    '【JSON 合法性（最高优先级）】',
+    '- 必须输出完整闭合的 JSON：每个 { 都有 }，每个 [ 都有 ]，每个字符串都有结尾引号。',
+    '- 数组元素之间必须有逗号，对象成员之间必须有逗号，最后一个元素后不得有逗号。',
+    '- 字符串内不得出现未转义的换行，需要换行时写成 \\n；不得出现未转义的双引号。',
+    '- 宁可缩短文字长度，也不得让 JSON 不完整。如内容过多，优先压缩 summary 与 reliability 的篇幅。',
   ].join('\n');
 
   /* ---------------------------------------------------------------------------
@@ -220,29 +233,171 @@
   }
 
   /* ---------------------------------------------------------------------------
-   * 调用 DeepSeek（浏览器直连，OpenAI 兼容格式）
+   * JSON 解析与修复
+   *   deepseek-flash 是推理模型，思维链同样消耗 max_tokens 预算。
+   *   即使预算充足，长输出仍可能被截断，因此这里做结构级修复而不是直接失败。
    * ------------------------------------------------------------------------ */
 
-  function extractJSON(text) {
-    if (!text) throw new Error('模型返回内容为空。');
-    let t = String(text).trim();
-    // 容错：剥离可能的代码围栏
-    t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-    try { return JSON.parse(t); } catch (e) { /* 继续尝试截取 */ }
-    const start = t.indexOf('{');
-    const end = t.lastIndexOf('}');
+  /** 截断的字符串字面量缺少结尾引号 */
+  function hasUnterminatedString(text) {
+    let inStr = false, esc = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') inStr = !inStr;
+    }
+    return inStr;
+  }
+
+  /** 补齐被截断的 JSON：闭合字符串、去尾逗号、平衡括号 */
+  function repairTruncated(text) {
+    let s = String(text).trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+    if (!s) return null;
+
+    const first = s.indexOf('{');
+    if (first < 0) return null;
+    s = s.slice(first);
+    const lastClose = s.lastIndexOf('}');
+    // 只在「明显被截断」时才需要补齐；若尾部已有完整结构则不动
+    let repaired = s;
+
+    if (hasUnterminatedString(repaired)) repaired += '"';
+
+    // 去掉尾部悬挂的逗号 / 冒号 / 残缺键
+    repaired = repaired.replace(/,\s*$/, '');
+    repaired = repaired.replace(/"[^"]*"\s*:\s*$/, '');
+    repaired = repaired.replace(/,\s*"[^"]*"\s*$/, '');
+    repaired = repaired.replace(/,\s*$/, '');
+
+    // 平衡括号与方括号（忽略字符串内的括号）
+    const stack = [];
+    let inStr = false, esc = false;
+    for (let i = 0; i < repaired.length; i++) {
+      const ch = repaired[i];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{') stack.push('}');
+      else if (ch === '[') stack.push(']');
+      else if (ch === '}' || ch === ']') stack.pop();
+    }
+    // 去掉悬挂的逗号后再闭合
+    repaired = repaired.replace(/,\s*$/, '');
+    while (stack.length) repaired += stack.pop();
+
+    // 修复对象内相邻成员缺少逗号的情形： "a": "x" "b": "y"
+    repaired = repaired.replace(/"\s*\n?\s*"/g, '", "');
+    // 去掉对象/数组里多余的连续逗号
+    repaired = repaired.replace(/,\s*,/g, ',');
+
+    if (repaired === s && lastClose >= 0 && lastClose < s.length - 1) {
+      repaired = s.slice(0, lastClose + 1);
+    }
+    return repaired;
+  }
+
+  /**
+   * 归一化：无论走哪条恢复路径，都要把展平的 structure/behavior/capability
+   * 重组为契约要求的 rootCause 对象，并且不残留展平键。
+   */
+  function normalizeParsed(d) {
+    if (!d || typeof d !== 'object') return d;
+    if (!d.rootCause || typeof d.rootCause !== 'object') {
+      if (d.structure || d.behavior || d.capability) {
+        d.rootCause = {
+          structure: d.structure || '',
+          behavior: d.behavior || '',
+          capability: d.capability || '',
+        };
+      }
+    } else {
+      // 已有 rootCause 时，用展平字段补齐缺失项
+      ['structure', 'behavior', 'capability'].forEach((k) => {
+        if (!d.rootCause[k] && d[k]) d.rootCause[k] = d[k];
+      });
+    }
+    delete d.structure;
+    delete d.behavior;
+    delete d.capability;
+    return d;
+  }
+
+  /**
+   * 解析模型返回。返回 { data, repaired }
+   * @throws 只有在完全无法解析时才抛错
+   */
+  function parseModelJSON(text) {
+    if (!text || !String(text).trim()) {
+      throw new Error('模型返回内容为空（通常是输出预算被思维链耗尽，请调高 max_tokens）');
+    }
+    const raw = String(text).trim();
+    const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+
+    // 1) 直接解析
+    try { return { data: normalizeParsed(JSON.parse(stripped)), repaired: false }; } catch (e) { /* 继续 */ }
+
+    // 2) 截取首个 { 到末个 }
+    const start = stripped.indexOf('{');
+    const end = stripped.lastIndexOf('}');
     if (start >= 0 && end > start) {
-      const slice = t.slice(start, end + 1);
-      try { return JSON.parse(slice); } catch (e2) {
-        throw new Error('模型返回的 JSON 无法解析：' + e2.message);
+      try {
+        return { data: normalizeParsed(JSON.parse(stripped.slice(start, end + 1))), repaired: false };
+      } catch (e) { /* 继续 */ }
+    }
+
+    // 3) 结构修复后解析
+    const fixed = repairTruncated(stripped);
+    if (fixed) {
+      try { return { data: normalizeParsed(JSON.parse(fixed)), repaired: true }; } catch (e) { /* 继续 */ }
+    }
+
+    // 4) 逐字段抢救
+    const salvaged = salvageFields(stripped);
+    if (salvaged) return { data: normalizeParsed(salvaged), repaired: true };
+
+    throw new Error('模型返回的内容既不是合法 JSON，也无法修复。原始返回前 160 字：' + raw.slice(0, 160));
+  }
+
+  /** 从残缺 JSON 中按已知键逐个捞取值 */
+  function salvageFields(text) {
+    const keys = ['summary', 'reliability', 'structure', 'behavior', 'capability',
+      'standardSuggestion', 'trainingSuggestion'];
+    const got = {};
+    let found = 0;
+    for (const k of keys) {
+      const re = new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"', 's');
+      const m = text.match(re);
+      if (m) { got[k] = m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n'); found++; }
+    }
+    for (const k of ['followUp', 'needsHuman']) {
+      const m = text.match(new RegExp('"' + k + '"\\s*:\\s*\\[([\\s\\S]*?)(?:\\]|$)', 's'));
+      if (m) {
+        const items = Array.from(m[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)).map((x) => x[1]);
+        if (items.length) { got[k] = items; found++; }
       }
     }
-    throw new Error('模型未返回可解析的 JSON。原始返回前 200 字：' + t.slice(0, 200));
+    if (!found) return null;
+    got.__salvaged = true;
+    return got;
+  }
+
+  /** 兼容旧调用名 */
+  function extractJSON(text) {
+    return parseModelJSON(text).data;
   }
 
   /**
    * @param {object} ctx 与 buildUserPayload 相同的上下文
-   * @param {object} opts { apiKey, model, apiBase, signal, temperature, onDelta }
+   * @param {object} opts { apiKey, model, apiBase, signal, temperature, maxTokens }
+   *
+   * 关于 max_tokens：deepseek-flash 为推理模型，思维链 token 计入 max_tokens 预算。
+   * 预算过小会导致「思维链耗尽预算 → 正文为空」或「正文被截断 → JSON 不完整」。
+   * 因此默认给足预算，并在检测到截断时自动加大预算重试一次。
    */
   async function analyze(ctx, opts) {
     opts = opts || {};
@@ -250,36 +405,78 @@
     if (!apiKey) throw new Error('未配置 API Key。请点击右上角「设置」填入后再试。');
     const base = (opts.apiBase || 'https://api.deepseek.com').replace(/\/+$/, '');
     const model = opts.model || 'deepseek-flash';
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: buildUserPayload(ctx) },
+    ];
 
-    const body = {
+    const started = Date.now();
+    let attempt = await requestOnce({
+      base, apiKey, model, messages,
+      maxTokens: opts.maxTokens || DEFAULT_MAX_TOKENS,
+      temperature: opts.temperature,
+      signal: opts.signal,
+    });
+
+    // 被长度上限截断 → 加大预算重试一次
+    // 注意：推理模型的思维链长度波动很大（实测同一输入 4165~8683 token），
+    // 故预算需给足倍数与固定余量，否则重试仍会被截断。
+    let retried = false;
+    if (attempt.truncated) {
+      retried = true;
+      const bigger = await requestOnce({
+        base, apiKey, model, messages,
+        maxTokens: Math.min(MAX_MAX_TOKENS, Math.round(attempt.maxTokens * 2.2) + 8000),
+        temperature: opts.temperature,
+        signal: opts.signal,
+      });
+      // 取内容更完整的一次
+      if (!bigger.truncated || bigger.content.length > attempt.content.length) attempt = bigger;
+    }
+
+    const elapsed = Date.now() - started;
+    const parsed = parseModelJSON(attempt.content);
+
+    return {
+      raw: attempt.content,
+      parsed: parsed.data,
+      repaired: parsed.repaired,
+      truncated: attempt.truncated,
+      retried: retried,
+      finishReason: attempt.finishReason,
+      reasoningTokens: attempt.reasoningTokens,
+      maxTokens: attempt.maxTokens,
       model: model,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: buildUserPayload(ctx) },
-      ],
-      temperature: opts.temperature === undefined ? 0.3 : opts.temperature,
-      max_tokens: 2600,
+      elapsedMs: elapsed,
+      usage: attempt.usage,
+      promptChars: messages[1].content.length,
+      promptPreview: messages[1].content.length,
+    };
+  }
+
+  /** 单次请求 */
+  async function requestOnce(o) {
+    const body = {
+      model: o.model,
+      messages: o.messages,
+      temperature: o.temperature === undefined ? 0.3 : o.temperature,
+      max_tokens: o.maxTokens,
       response_format: { type: 'json_object' },
       stream: false,
     };
 
-    const started = Date.now();
     let resp;
     try {
-      resp = await fetch(base + '/chat/completions', {
+      resp = await fetch(o.base + '/chat/completions', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: 'Bearer ' + apiKey,
-        },
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + o.apiKey },
         body: JSON.stringify(body),
-        signal: opts.signal,
+        signal: o.signal,
       });
     } catch (e) {
       throw new Error('请求模型失败（网络或跨域问题）：' + e.message);
     }
 
-    const elapsed = Date.now() - started;
     const text = await resp.text();
     if (!resp.ok) {
       let msg = text.slice(0, 300);
@@ -294,15 +491,20 @@
     try { payload = JSON.parse(text); } catch (e) { throw new Error('接口返回不是合法 JSON。'); }
     const choice = payload.choices && payload.choices[0];
     if (!choice || !choice.message) throw new Error('接口返回缺少 choices[0].message。');
+
     const content = choice.message.content || '';
+    const finishReason = choice.finish_reason || '';
+    const usage = payload.usage || {};
+    const reasoningTokens = usage.completion_tokens_details
+      ? usage.completion_tokens_details.reasoning_tokens : null;
 
     return {
-      raw: content,
-      parsed: extractJSON(content),
-      model: model,
-      elapsedMs: elapsed,
-      usage: payload.usage || null,
-      promptPreview: buildUserPayload(ctx).length,
+      content: content,
+      finishReason: finishReason,
+      truncated: finishReason === 'length',
+      maxTokens: o.maxTokens,
+      usage: usage,
+      reasoningTokens: reasoningTokens,
     };
   }
 
@@ -339,5 +541,10 @@
     analyze: analyze,
     testKey: testKey,
     extractJSON: extractJSON,
+    parseModelJSON: parseModelJSON,
+    repairTruncated: repairTruncated,
+    salvageFields: salvageFields,
+    DEFAULT_MAX_TOKENS: DEFAULT_MAX_TOKENS,
+    MAX_MAX_TOKENS: MAX_MAX_TOKENS,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
