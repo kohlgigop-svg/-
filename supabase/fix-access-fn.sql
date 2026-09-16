@@ -1,0 +1,32 @@
+-- =============================================================================
+-- 补丁：修复 function digest(text, unknown) does not exist（错误码 42883）
+-- -----------------------------------------------------------------------------
+-- 原因：Supabase 把 pgcrypto 扩展装在 extensions schema 里，
+--       而 qc_access_ok 函数的 search_path 只写了 public，函数内部看不见 digest。
+-- 修法：把 extensions 加进该函数的 search_path，并把 LANGUAGE 改为 plpgsql。
+--
+-- 使用：Supabase 控制台 → SQL Editor → New query → 粘贴本文件全文 → Run
+--       应显示 Success. No rows returned
+--
+-- 说明：本补丁只重建 qc_access_ok 一个函数，不影响已建好的表与其他函数。
+--       运行完请回到工具里点「测试并连接」。
+-- =============================================================================
+
+create or replace function public.qc_access_ok(code text)
+returns boolean
+language plpgsql
+stable
+security definer
+set search_path = public, extensions
+as $$
+begin
+  return encode(digest(coalesce(code, ''), 'sha256'), 'hex') =
+         '2b3ac575436c0f15e2eae20a595c9b868fe47c3e0bd5c9228a870adbcf8af5d1';
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 验证（把 qc-eval-2026 换成你实际使用的访问码）
+-- ---------------------------------------------------------------------------
+-- select public.qc_check_access('qc-eval-2026');   -- 应为 true
+-- select public.qc_check_access('乱填的码');        -- 应为 false

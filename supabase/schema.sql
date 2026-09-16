@@ -1,0 +1,391 @@
+-- =============================================================================
+-- 质检人员质量评估工具 · Supabase 数据库结构
+-- -----------------------------------------------------------------------------
+-- 安装步骤：
+--   1. Supabase 控制台 → 左侧「SQL Editor」→ New query
+--   2. 全文粘贴本文件（默认访问码已配置好，无需改动即可直接运行）
+--   3. 点 Run，应显示 Success. No rows returned
+--   4. 控制台 → Authentication → Sign In / Providers → 打开「Anonymous sign-ins」
+--      （用于区分不同成员的提交，实现「只能改删自己的记录」；不收集个人信息）
+--
+-- 当前配置的访问码是：qc-eval-2026（数据库只存它的哈希，不存明文）
+-- 如需换成自己的访问码：浏览器按 F12 → Console，运行下面这行，把打印出的
+-- 64 位字符串替换到第 1 节 qc_access_ok 函数里即可：
+--   crypto.subtle.digest('SHA-256', new TextEncoder().encode('你的访问码'))
+--     .then(b => console.log([...new Uint8Array(b)].map(x => x.toString(16).padStart(2,'0')).join('')))
+-- =============================================================================
+
+-- 若报 “function digest(text, unknown) does not exist”，先执行下面这行
+create extension if not exists pgcrypto;
+
+-- ---------------------------------------------------------------------------
+-- 1. 访问码校验
+--    ⚠️ 把下面的哈希替换成你自己访问码的哈希（默认码为 qc-eval-2026）
+--
+--    注意 search_path 必须包含 extensions：
+--    Supabase 把 pgcrypto 装在 extensions schema 里，只写 public 会导致
+--    函数内部找不到 digest 而报 42883（function digest(text, unknown) does not exist）。
+-- ---------------------------------------------------------------------------
+create or replace function public.qc_access_ok(code text)
+returns boolean
+language plpgsql
+stable
+security definer
+set search_path = public, extensions
+as $$
+begin
+  return encode(digest(coalesce(code, ''), 'sha256'), 'hex') =
+         '2b3ac575436c0f15e2eae20a595c9b868fe47c3e0bd5c9228a870adbcf8af5d1';
+end;
+$$;
+
+comment on function public.qc_access_ok(text) is
+  '校验访问码；比较的是 SHA-256 哈希，明文不入库。';
+
+-- ---------------------------------------------------------------------------
+-- 2. 表结构
+-- ---------------------------------------------------------------------------
+create table if not exists public.qc_projects (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null,
+  created_by  uuid,                                  -- Supabase 匿名登录的 auth.uid()
+  created_at  timestamptz not null default now(),
+  constraint qc_projects_name_len check (char_length(trim(name)) between 1 and 80)
+);
+create unique index if not exists qc_projects_name_uniq on public.qc_projects (name);
+
+create table if not exists public.qc_records (
+  id           uuid primary key default gen_random_uuid(),
+  project_id   uuid not null references public.qc_projects(id) on delete cascade,
+  period_label text not null,
+  inspector    text,
+  payload      jsonb not null,
+  submitter    uuid not null,                        -- 提交者的 auth.uid()
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  revision     integer not null default 1,
+  constraint qc_records_period_len check (char_length(trim(period_label)) between 1 and 60)
+);
+create unique index if not exists qc_records_project_period_uniq
+  on public.qc_records (project_id, period_label);
+create index if not exists qc_records_project_idx
+  on public.qc_records (project_id, created_at desc);
+
+-- ---------------------------------------------------------------------------
+-- 3. 开启行级权限
+--    直接访问表一律禁止（不给任何策略＝全部拒绝）；
+--    所有读写都走第 4 节的 RPC，访问码在函数内校验。
+-- ---------------------------------------------------------------------------
+alter table public.qc_projects enable row level security;
+alter table public.qc_records  enable row level security;
+
+revoke all on public.qc_projects from anon, authenticated;
+revoke all on public.qc_records  from anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 4. RPC：带访问码的读与写
+-- ---------------------------------------------------------------------------
+
+-- 4.1 读取全部项目（含每个项目的记录）
+create or replace function public.qc_fetch_all(p_code text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_out jsonb;
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+
+  select coalesce(jsonb_agg(row_to_json(t) order by t.project_name), '[]'::jsonb)
+    into v_out
+  from (
+    select
+      p.id            as project_id,
+      p.name          as project_name,
+      p.created_at    as project_created_at,
+      coalesce(
+        (select jsonb_agg(jsonb_build_object(
+                  'id', r.id,
+                  'periodLabel', r.period_label,
+                  'inspector', r.inspector,
+                  'payload', r.payload,
+                  'submitter', r.submitter,
+                  'createdAt', r.created_at,
+                  'updatedAt', r.updated_at,
+                  'revision', r.revision
+                ) order by r.created_at desc)
+           from qc_records r where r.project_id = p.id),
+        '[]'::jsonb
+      ) as records
+    from qc_projects p
+  ) t;
+
+  return v_out;
+end;
+$$;
+
+-- 4.2 新增 / 修订一条记录（同项目同周期视为修订，仅本人可改）
+create or replace function public.qc_upsert_record(
+  p_code         text,
+  p_project_name text,
+  p_period       text,
+  p_inspector    text,
+  p_payload      jsonb
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid        uuid := auth.uid();
+  v_project_id uuid;
+  v_existing   public.qc_records;
+  v_result     public.qc_records;
+  v_name       text := trim(coalesce(p_project_name, ''));
+  v_period     text := trim(coalesce(p_period, ''));
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话，请刷新页面重试' using errcode = '42501';
+  end if;
+  if char_length(v_name) = 0 then
+    raise exception 'PROJECT_NAME_EMPTY: 项目名称不能为空';
+  end if;
+  if char_length(v_period) = 0 then
+    raise exception 'PERIOD_EMPTY: 评估周期不能为空';
+  end if;
+
+  insert into qc_projects (name, created_by)
+  values (v_name, v_uid)
+  on conflict (name) do nothing;
+
+  select id into v_project_id from qc_projects where name = v_name;
+
+  select * into v_existing
+    from qc_records
+   where project_id = v_project_id and period_label = v_period;
+
+  if found then
+    if v_existing.submitter <> v_uid then
+      raise exception 'NOT_OWNER: 该周期的记录由其他成员提交，你只能修订自己提交的记录' using errcode = '42501';
+    end if;
+    update qc_records
+       set payload = p_payload,
+           inspector = p_inspector,
+           updated_at = now(),
+           revision = revision + 1
+     where id = v_existing.id
+     returning * into v_result;
+  else
+    insert into qc_records (project_id, period_label, inspector, payload, submitter)
+    values (v_project_id, v_period, p_inspector, p_payload, v_uid)
+    returning * into v_result;
+  end if;
+
+  return jsonb_build_object(
+    'id', v_result.id,
+    'periodLabel', v_result.period_label,
+    'revision', v_result.revision,
+    'createdAt', v_result.created_at,
+    'updatedAt', v_result.updated_at
+  );
+end;
+$$;
+
+-- 4.3 删除记录（仅本人提交的）
+create or replace function public.qc_delete_record(
+  p_code      text,
+  p_record_id uuid
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid   uuid := auth.uid();
+  v_owner uuid;
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话' using errcode = '42501';
+  end if;
+
+  select submitter into v_owner from qc_records where id = p_record_id;
+  if v_owner is null then
+    return false;
+  end if;
+  if v_owner <> v_uid then
+    raise exception 'NOT_OWNER: 只能删除自己提交的记录' using errcode = '42501';
+  end if;
+
+  delete from qc_records where id = p_record_id;
+  return true;
+end;
+$$;
+
+-- 4.4 删除项目（仅当项目下没有他人提交的记录）
+create or replace function public.qc_delete_project(
+  p_code       text,
+  p_project_id uuid
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := auth.uid();
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话' using errcode = '42501';
+  end if;
+
+  if exists (select 1 from qc_records
+              where project_id = p_project_id and submitter <> v_uid) then
+    raise exception 'PROJECT_HAS_OTHERS_RECORDS: 该项目下存在其他成员提交的记录，不能删除' using errcode = '42501';
+  end if;
+
+  delete from qc_projects where id = p_project_id;
+  return true;
+end;
+$$;
+
+-- 4.5 重命名项目
+create or replace function public.qc_rename_project(
+  p_code       text,
+  p_project_id uuid,
+  p_new_name   text
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid  uuid := auth.uid();
+  v_name text := trim(coalesce(p_new_name, ''));
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话' using errcode = '42501';
+  end if;
+  if char_length(v_name) = 0 then
+    raise exception 'PROJECT_NAME_EMPTY: 项目名称不能为空';
+  end if;
+  if not exists (select 1 from qc_projects where id = p_project_id and created_by = v_uid) then
+    raise exception 'NOT_OWNER: 只能重命名自己创建的项目' using errcode = '42501';
+  end if;
+
+  update qc_projects set name = v_name where id = p_project_id;
+  return true;
+end;
+$$;
+
+-- 4.6 校验访问码（前端用于给出即时反馈，不返回任何数据）
+create or replace function public.qc_check_access(p_code text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+begin
+  return qc_access_ok(p_code);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 4.7 管理员清理（用于处理无法归属的孤儿数据）
+--   背景：记录归属由浏览器的匿名会话决定。若成员清除浏览器数据、换设备或离职，
+--         其记录会变成「无主数据」——任何人都无法修订或删除，项目也删不掉。
+--         此时只能由持有访问码的人在控制台执行本函数清理。
+--   安全：需同时提供正确访问码与确认串；单项目一次最多删 200 条，避免误操作清库。
+-- ---------------------------------------------------------------------------
+create or replace function public.qc_admin_cleanup(
+  p_code       text,
+  p_confirm    text,
+  p_project_id uuid default null
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_records  integer := 0;
+  v_projects integer := 0;
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if p_confirm is distinct from 'CONFIRM_DELETE' then
+    raise exception 'CONFIRM_REQUIRED: 需传入确认串 CONFIRM_DELETE';
+  end if;
+
+  if p_project_id is null then
+    -- 清理所有测试用项目（名称以 __E2E 开头）
+    select count(*) into v_records
+      from qc_records r join qc_projects p on p.id = r.project_id
+     where p.name like '\_\_E2E%' escape '\';
+    delete from qc_projects where name like '\_\_E2E%' escape '\';
+    get diagnostics v_projects = row_count;
+  else
+    select count(*) into v_records from qc_records where project_id = p_project_id;
+    if v_records > 200 then
+      raise exception 'TOO_MANY: 单次最多清理 200 条记录，当前 % 条', v_records;
+    end if;
+    delete from qc_records where project_id = p_project_id;
+    delete from qc_projects where id = p_project_id;
+    get diagnostics v_projects = row_count;
+  end if;
+
+  return jsonb_build_object('deletedRecords', v_records, 'deletedProjects', v_projects);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 5. 授权：允许匿名与已登录用户调用这些函数（函数内部自行校验访问码）
+-- ---------------------------------------------------------------------------
+grant execute on function public.qc_check_access(text)                          to anon, authenticated;
+grant execute on function public.qc_fetch_all(text)                             to anon, authenticated;
+grant execute on function public.qc_upsert_record(text, text, text, text, jsonb) to anon, authenticated;
+grant execute on function public.qc_delete_record(text, uuid)                    to anon, authenticated;
+grant execute on function public.qc_delete_project(text, uuid)                   to anon, authenticated;
+grant execute on function public.qc_rename_project(text, uuid, text)             to anon, authenticated;
+grant execute on function public.qc_admin_cleanup(text, text, uuid)              to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 6. 只读视图（便于用 SQL 直接查或做报表；视图不对外授权，仅控制台可用）
+-- ---------------------------------------------------------------------------
+create or replace view public.qc_records_flat as
+select
+  p.name                                             as project_name,
+  r.period_label,
+  r.inspector,
+  (r.payload -> 'metrics' ->> 'piActual')::numeric   as pi_actual,
+  (r.payload -> 'metrics' ->> 'tauQc')::numeric      as tau_qc,
+  (r.payload -> 'metrics' ->> 'precision')::numeric  as precision,
+  (r.payload -> 'metrics' ->> 'recall')::numeric     as recall,
+  (r.payload -> 'metrics' ->> 'f1')::numeric         as f1,
+  (r.payload -> 'counts' ->> 'FN')::int              as fn_count,
+  (r.payload -> 'counts' ->> 'FP')::int              as fp_count,
+  r.created_at
+from qc_records r
+join qc_projects p on p.id = r.project_id
+order by p.name, r.created_at desc;
+
+-- =============================================================================
+-- 安装完成后自检（把 '你的访问码' 换成真实访问码执行）：
+--   select public.qc_check_access('你的访问码');   -- 应为 true
+--   select public.qc_check_access('错误码');        -- 应为 false
+--   select public.qc_fetch_all('你的访问码');       -- 应为 []
+-- =============================================================================

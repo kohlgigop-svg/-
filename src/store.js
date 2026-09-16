@@ -81,6 +81,11 @@
     acceptAccuracy: 0.95,  // 默认验收准确率
     tolerancePct: 0.0,     // 观察线判定容差（相对）
     aiAutoRun: false,
+    // 云端共享（Supabase）
+    cloudUrl: '',
+    cloudKey: '',
+    cloudCode: '',
+    cloudMode: 'dual',     // dual 双写 / cloud 仅云端 / local 仅本地
   };
 
   function getSettings() {
@@ -256,6 +261,85 @@
     return p.records.filter((r) => r.id !== excludeRecordId);
   }
 
+  /** 按周期合并一条云端记录：同周期已存在则更新，否则新增 */
+  function mergeRecord(projectId, record) {
+    const all = loadAll();
+    if (!all[projectId]) return null;
+    const list = all[projectId].records || [];
+    const idx = list.findIndex((r) => r.periodLabel && r.periodLabel === record.periodLabel);
+    if (idx >= 0) {
+      // 保留本地 id 与本地已有的云标识，仅用云端内容更新
+      const merged = Object.assign({}, list[idx], record, {
+        id: list[idx].id,
+        savedAt: list[idx].savedAt || record.savedAt || Date.now(),
+      });
+      list[idx] = merged;
+      all[projectId].records = list;
+      all[projectId].updatedAt = Date.now();
+      saveAll(all);
+      return merged;
+    }
+    return addRecord(projectId, record, false);
+  }
+
+  /** 批量合并（云端拉取时使用），返回 {added, updated} */
+  function mergeRecords(projectId, records) {
+    let added = 0, updated = 0;
+    const all0 = loadAll();
+    if (!all0[projectId]) return { added: 0, updated: 0 };
+    const before = (all0[projectId].records || []).map((r) => r.periodLabel);
+    for (const rec of records) {
+      const existed = before.indexOf(rec.periodLabel) >= 0;
+      mergeRecord(projectId, rec);
+      if (existed) updated++; else { added++; before.push(rec.periodLabel); }
+    }
+    return { added: added, updated: updated };
+  }
+
+  /** 给指定周期的记录回填云端标识（不改变其它字段） */
+  function setCloudMeta(projectId, periodLabel, cloudId, submitter) {
+    const all = loadAll();
+    if (!all[projectId]) return false;
+    const rec = (all[projectId].records || []).find((r) => r.periodLabel === periodLabel);
+    if (!rec) return false;
+    rec.cloudId = cloudId || null;
+    rec.cloudSubmitter = submitter || null;
+    all[projectId].updatedAt = Date.now();
+    saveAll(all);
+    return true;
+  }
+
+  /** 按项目名查找，找不到则以指定 id 创建（云端拉取时用） */
+  function ensureProject(name, id, config) {
+    const all = loadAll();
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return null;
+    const found = Object.keys(all).find((k) => all[k].name === trimmed);
+    if (found) {
+      if (config) all[found].config = Object.assign({}, all[found].config, config);
+      saveAll(all);
+      return all[found];
+    }
+    const pid = id && !all[id] ? id : uid('prj');
+    const now = Date.now();
+    all[pid] = {
+      id: pid,
+      name: trimmed,
+      createdAt: now,
+      updatedAt: now,
+      config: Object.assign({ acceptAccuracy: 0.95, obsWindow: 3 }, config || {}),
+      records: [],
+      cloudId: id || null,
+    };
+    saveAll(all);
+    return all[pid];
+  }
+
+  /** 删除本地项目（不触发当前项目切换提示） */
+  function removeProject(id) {
+    return deleteProject(id);
+  }
+
   /* ---------------------------------------------------------------------------
    * 当前项目
    * ------------------------------------------------------------------------ */
@@ -386,6 +470,11 @@
     deleteRecord: deleteRecord,
     clearRecords: clearRecords,
     getHistory: getHistory,
+    mergeRecord: mergeRecord,
+    mergeRecords: mergeRecords,
+    setCloudMeta: setCloudMeta,
+    ensureProject: ensureProject,
+    removeProject: removeProject,
     getCurrentProjectId: getCurrentProjectId,
     setCurrentProjectId: setCurrentProjectId,
     exportAll: exportAll,

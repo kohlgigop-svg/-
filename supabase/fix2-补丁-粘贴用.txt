@@ -1,0 +1,238 @@
+﻿-- =============================================================================
+-- 补丁 2：修复 qc_fetch_all 的字段引用错误 + 统一所有函数的 search_path
+-- -----------------------------------------------------------------------------
+-- 修复内容：
+--   1. qc_fetch_all 里排序写成 t.name，但子查询输出的字段名是 project_name
+--      → 报 column t.name does not exist（42703）。已改为 t.project_name。
+--   2. 6 个业务函数的 search_path 只写了 public，而 Supabase 把 pgcrypto
+--      装在 extensions schema，存在解析不到的风险，且会被安全审查标记。
+--      → 全部统一为 public, extensions。
+--
+-- 使用：Supabase 控制台 → SQL Editor → New query → 粘贴本文件全文 → Run
+--       应显示 Success. No rows returned
+--
+-- 说明：本补丁只重建函数，不动表结构与已有数据，安全可重复执行。
+-- =============================================================================
+
+-- 4.1 读取全部项目（含每个项目的记录）
+create or replace function public.qc_fetch_all(p_code text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_out jsonb;
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+
+  select coalesce(jsonb_agg(row_to_json(t) order by t.project_name), '[]'::jsonb)
+    into v_out
+  from (
+    select
+      p.id            as project_id,
+      p.name          as project_name,
+      p.created_at    as project_created_at,
+      coalesce(
+        (select jsonb_agg(jsonb_build_object(
+                  'id', r.id,
+                  'periodLabel', r.period_label,
+                  'inspector', r.inspector,
+                  'payload', r.payload,
+                  'submitter', r.submitter,
+                  'createdAt', r.created_at,
+                  'updatedAt', r.updated_at,
+                  'revision', r.revision
+                ) order by r.created_at desc)
+           from qc_records r where r.project_id = p.id),
+        '[]'::jsonb
+      ) as records
+    from qc_projects p
+  ) t;
+
+  return v_out;
+end;
+$$;
+
+-- 4.2 新增 / 修订一条记录（同项目同周期视为修订，仅本人可改）
+create or replace function public.qc_upsert_record(
+  p_code         text,
+  p_project_name text,
+  p_period       text,
+  p_inspector    text,
+  p_payload      jsonb
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid        uuid := auth.uid();
+  v_project_id uuid;
+  v_existing   public.qc_records;
+  v_result     public.qc_records;
+  v_name       text := trim(coalesce(p_project_name, ''));
+  v_period     text := trim(coalesce(p_period, ''));
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话，请刷新页面重试' using errcode = '42501';
+  end if;
+  if char_length(v_name) = 0 then
+    raise exception 'PROJECT_NAME_EMPTY: 项目名称不能为空';
+  end if;
+  if char_length(v_period) = 0 then
+    raise exception 'PERIOD_EMPTY: 评估周期不能为空';
+  end if;
+
+  insert into qc_projects (name, created_by)
+  values (v_name, v_uid)
+  on conflict (name) do nothing;
+
+  select id into v_project_id from qc_projects where name = v_name;
+
+  select * into v_existing
+    from qc_records
+   where project_id = v_project_id and period_label = v_period;
+
+  if found then
+    if v_existing.submitter <> v_uid then
+      raise exception 'NOT_OWNER: 该周期的记录由其他成员提交，你只能修订自己提交的记录' using errcode = '42501';
+    end if;
+    update qc_records
+       set payload = p_payload,
+           inspector = p_inspector,
+           updated_at = now(),
+           revision = revision + 1
+     where id = v_existing.id
+     returning * into v_result;
+  else
+    insert into qc_records (project_id, period_label, inspector, payload, submitter)
+    values (v_project_id, v_period, p_inspector, p_payload, v_uid)
+    returning * into v_result;
+  end if;
+
+  return jsonb_build_object(
+    'id', v_result.id,
+    'periodLabel', v_result.period_label,
+    'revision', v_result.revision,
+    'createdAt', v_result.created_at,
+    'updatedAt', v_result.updated_at
+  );
+end;
+$$;
+
+-- 4.3 删除记录（仅本人提交的）
+create or replace function public.qc_delete_record(
+  p_code      text,
+  p_record_id uuid
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid   uuid := auth.uid();
+  v_owner uuid;
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话' using errcode = '42501';
+  end if;
+
+  select submitter into v_owner from qc_records where id = p_record_id;
+  if v_owner is null then
+    return false;
+  end if;
+  if v_owner <> v_uid then
+    raise exception 'NOT_OWNER: 只能删除自己提交的记录' using errcode = '42501';
+  end if;
+
+  delete from qc_records where id = p_record_id;
+  return true;
+end;
+$$;
+
+-- 4.4 删除项目（仅当项目下没有他人提交的记录）
+create or replace function public.qc_delete_project(
+  p_code       text,
+  p_project_id uuid
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := auth.uid();
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话' using errcode = '42501';
+  end if;
+
+  if exists (select 1 from qc_records
+              where project_id = p_project_id and submitter <> v_uid) then
+    raise exception 'PROJECT_HAS_OTHERS_RECORDS: 该项目下存在其他成员提交的记录，不能删除' using errcode = '42501';
+  end if;
+
+  delete from qc_projects where id = p_project_id;
+  return true;
+end;
+$$;
+
+-- 4.5 重命名项目
+create or replace function public.qc_rename_project(
+  p_code       text,
+  p_project_id uuid,
+  p_new_name   text
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid  uuid := auth.uid();
+  v_name text := trim(coalesce(p_new_name, ''));
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if v_uid is null then
+    raise exception 'NO_SESSION: 未取得匿名登录会话' using errcode = '42501';
+  end if;
+  if char_length(v_name) = 0 then
+    raise exception 'PROJECT_NAME_EMPTY: 项目名称不能为空';
+  end if;
+  if not exists (select 1 from qc_projects where id = p_project_id and created_by = v_uid) then
+    raise exception 'NOT_OWNER: 只能重命名自己创建的项目' using errcode = '42501';
+  end if;
+
+  update qc_projects set name = v_name where id = p_project_id;
+  return true;
+end;
+$$;
+
+-- 4.6 校验访问码（前端用于给出即时反馈，不返回任何数据）
+create or replace function public.qc_check_access(p_code text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+begin
+  return qc_access_ok(p_code);
+end;
+$$;
+
+-- =============================================================================
+-- 验证：在控制台执行（把 qc-eval-2026 换成你实际使用的访问码）
+--   select public.qc_fetch_all('qc-eval-2026');   -- 应为 []（或已有的项目数组）
+-- =============================================================================

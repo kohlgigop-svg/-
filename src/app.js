@@ -8,6 +8,7 @@
   const S = window.QCStore;
   const D = window.QCDiag;
   const AI = window.QCAI;
+  const CL = window.QCCloud;
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => {
@@ -48,6 +49,107 @@
     debugOpen: false,
     historyOpen: {},
   };
+
+  /* ==========================================================================
+   * 云端同步
+   * ======================================================================== */
+  function cloudSettings() { return S.getSettings(); }
+
+  function cloudHooks() {
+    return {
+      ensureProject: (name, cloudId) => S.ensureProject(name, cloudId, null),
+      mergeRecords: (projectId, records) => S.mergeRecords(projectId, records),
+    };
+  }
+
+  /** 从云端拉取并合并到本地，然后刷新界面 */
+  async function cloudPull(opts) {
+    const settings = cloudSettings();
+    if (!CL.isConfigured(settings)) return null;
+    const quiet = opts && opts.quiet;
+    try {
+      if (!quiet) toast('正在拉取云端数据…');
+      const stats = await CL.syncToLocal(settings, cloudHooks());
+      renderProjectSelect();
+      renderProjectAdmin();
+      renderHistory();
+      updateCloudStatus();
+      if (!quiet) {
+        toast('云端同步完成：' + stats.projects + ' 个项目、' + stats.records + ' 条记录'
+          + (stats.added ? '（新增 ' + stats.added + '）' : ''), 'ok');
+      }
+      return stats;
+    } catch (e) {
+      if (!quiet) toast('云端拉取失败：' + e.message, 'err');
+      updateCloudStatus(e.message);
+      return null;
+    }
+  }
+
+  function updateCloudStatus(errMsg) {
+    const settings = cloudSettings();
+    const el2 = $('cloudStatus');
+    if (!el2) return;
+    const mode = settings.cloudMode || 'dual';
+    if (mode === 'local' || !CL.isConfigured(settings)) {
+      el2.className = 'banner banner-info';
+      el2.textContent = '当前为纯本地模式：数据只存在本机浏览器，不会同步到云端。如需多人共享，请在「设置」中配置云端。';
+      el2.hidden = false;
+      return;
+    }
+    if (errMsg) {
+      el2.className = 'banner banner-alert';
+      el2.textContent = '云端同步异常：' + errMsg;
+      el2.hidden = false;
+      return;
+    }
+    if (CL.isConnected(settings)) {
+      const uid = CL.currentUserId();
+      el2.className = 'banner banner-ok';
+      el2.textContent = '云端已连接（' + mode === 'cloud' ? '仅云端' : '本地 + 云端双写'
+        + '）　成员标识 ' + (uid ? uid.slice(0, 8) : '—')
+        + '　提交者本人可修订与删除自己的记录。';
+      el2.hidden = false;
+      return;
+    }
+    el2.className = 'banner banner-warn';
+    el2.textContent = '云端已配置但尚未连接，请到「设置」点「测试并连接」。';
+    el2.hidden = false;
+  }
+
+  /** 保存时同步到云端 */
+  async function cloudPushRecord(project, record) {
+    const settings = cloudSettings();
+    const mode = settings.cloudMode || 'dual';
+    if (mode === 'local' || !CL.isConfigured(settings)) return null;
+    try {
+      const res = await CL.upsertRecord(settings, {
+        projectName: project.name,
+        periodLabel: record.periodLabel,
+        inspector: record.input ? record.input.inspector : null,
+        payload: {
+          input: record.input,
+          counts: record.counts,
+          metrics: record.metrics,
+          effSS: record.effSS,
+          warning: record.warning,
+          observation: record.observation,
+          verdicts: record.verdicts,
+          recallVerdict: record.recallVerdict,
+          diagnostics: record.diagnostics,
+          acceptAccuracy: record.acceptAccuracy,
+          obsWindow: record.obsWindow,
+          aiSummary: record.aiSummary,
+          computedAt: record.computedAt,
+        },
+      });
+      updateCloudStatus();
+      return res;
+    } catch (e) {
+      updateCloudStatus(e.message);
+      throw e;
+    }
+  }
 
   /* ==========================================================================
    * 提示
@@ -690,7 +792,16 @@
       tr.appendChild(tdExp);
 
       tr.appendChild(el('td', null, rec.periodLabel || '—'));
-      tr.appendChild(el('td', null, (rec.input && rec.input.inspector) || '—'));
+      const inspCell = el('td');
+      inspCell.appendChild(document.createTextNode((rec.input && rec.input.inspector) || '—'));
+      if (rec.cloudId) {
+        const mine = rec.cloudSubmitter && rec.cloudSubmitter === CL.currentUserId();
+        const tag = el('span', 'badge ' + (mine ? 'badge-info' : 'badge-na'), mine ? '本人' : '他人');
+        tag.style.marginLeft = '6px';
+        tag.title = mine ? '你提交的记录，可修订与删除' : '其他成员提交，你只能查看';
+        inspCell.appendChild(tag);
+      }
+      tr.appendChild(inspCell);
       tr.appendChild(el('td', 'num', pct(mm.piActual, 2)));
       tr.appendChild(el('td', 'num', pct(mm.tauQc, 2)));
       tr.appendChild(el('td', 'num', pct(mm.precision, 2)));
@@ -708,12 +819,29 @@
       tdOp.appendChild(btnLoad);
       const btnDel = el('button', 'btn btn-mini btn-ghost btn-danger', '删除');
       btnDel.type = 'button';
-      btnDel.addEventListener('click', () => {
-        if (!window.confirm('删除周期「' + (rec.periodLabel || '未命名') + '」的记录？')) return;
+      btnDel.addEventListener('click', async () => {
+        const settings = S.getSettings();
+        const onCloud = (settings.cloudMode || 'dual') !== 'local' && CL.isConfigured(settings);
+        const mine = rec.cloudSubmitter && rec.cloudSubmitter === CL.currentUserId();
+        if (onCloud && rec.cloudId && !mine) {
+          toast('该记录由其他成员提交，你只能删除自己提交的记录。', 'err');
+          return;
+        }
+        if (!window.confirm('删除周期「' + (rec.periodLabel || '未命名') + '」的记录？'
+          + (onCloud && rec.cloudId ? '（云端与本机同时删除）' : ''))) return;
         S.deleteRecord(project.id, rec.id);
-        toast('已删除记录', 'ok');
         renderHistory();
         renderProjectSelect();
+        toast('已从本机删除', 'ok');
+        if (onCloud && rec.cloudId) {
+          try {
+            await CL.deleteRecord(settings, rec.cloudId);
+            toast('已从云端删除', 'ok');
+          } catch (e) {
+            toast('云端删除失败：' + e.message, 'err');
+            updateCloudStatus(e.message);
+          }
+        }
       });
       tdOp.appendChild(btnDel);
       tr.appendChild(tdOp);
@@ -938,10 +1066,27 @@
 
     try {
       S.addRecord(project.id, rec, true);
-      toast('已保存记录：周期「' + period + '」', 'ok');
       renderProjectSelect();
     } catch (e) {
       toast(e.message, 'err');
+      return;
+    }
+
+    // 云端写入（失败不回滚本地，只提示，避免网络问题导致数据丢失）
+    const mode = cloudSettings().cloudMode || 'dual';
+    if (mode !== 'local' && CL.isConfigured(cloudSettings())) {
+      toast('已保存到本机，正在同步云端…');
+      cloudPushRecord(project, rec).then((res) => {
+        if (res) {
+          toast('已同步到云端：周期「' + period + '」' + (res.revision > 1 ? '（第 ' + res.revision + ' 版）' : ''), 'ok');
+          // 回填云端标识，便于后续判定改删权限
+          if (res.id) S.setCloudMeta(project.id, period, res.id, CL.currentUserId());
+        }
+      }).catch((e) => {
+        toast('云端同步失败（本机已保存）：' + e.message, 'err');
+      });
+    } else {
+      toast('已保存记录：周期「' + period + '」（本机）', 'ok');
     }
   }
 
@@ -1021,13 +1166,27 @@
       });
       const bDel = el('button', 'btn btn-mini btn-ghost btn-danger', '删除');
       bDel.type = 'button';
-      bDel.addEventListener('click', () => {
+      bDel.addEventListener('click', async () => {
         if (!window.confirm('删除项目「' + p.name + '」及其 ' + p.recordCount + ' 次记录？此操作不可恢复。')) return;
+        // 先取出云端标识，再删除本地项目
+        const beforeDel = S.getProject(p.id);
+        const cloudId = (beforeDel && beforeDel.cloudId) || null;
         S.deleteProject(p.id);
-        toast('已删除项目', 'ok');
         renderProjectAdmin();
         renderProjectSelect();
         renderHistory();
+        toast('已从本机删除项目', 'ok');
+        // 云端：仅当该项目下没有他人记录时才允许删除
+        const settings = S.getSettings();
+        if ((settings.cloudMode || 'dual') !== 'local' && CL.isConfigured(settings) && cloudId) {
+          try {
+            await CL.deleteProject(settings, cloudId);
+            toast('已从云端删除项目', 'ok');
+          } catch (e) {
+            toast('云端删除失败：' + e.message, 'err');
+            updateCloudStatus(e.message);
+          }
+        }
       });
       right.appendChild(bRename);
       right.appendChild(bDel);
@@ -1155,12 +1314,22 @@
     $('setBootstrapB').value = s.bootstrapB || 4000;
     $('setAlpha').value = String(s.alpha || 0.05);
     $('setMaxTokens').value = s.maxTokens || 16000;
+    $('setCloudUrl').value = s.cloudUrl || '';
+    $('setCloudKey').value = s.cloudKey || '';
+    $('setCloudCode').value = s.cloudCode || '';
+    $('setCloudMode').value = s.cloudMode || 'dual';
     $('keyTestResult').textContent = '';
+    $('cloudTestResult').textContent = '';
     $('settingsMask').hidden = false;
   }
   function closeSettings() { $('settingsMask').hidden = true; }
 
-  function saveSettingsFromForm() {
+  /** 保存设置（含云端）。云端连接状态变化时自动拉取一次。 */
+  function saveSettingsFromForm(opts) {
+    const quiet = opts && opts.quiet;
+    const before = S.getSettings();
+    const cloudUrlRaw = $('setCloudUrl').value.trim();
+    const cloudUrl = cloudUrlRaw ? CL.normalizeUrl(cloudUrlRaw) : '';
     S.saveSettings({
       apiKey: $('setApiKey').value.trim(),
       model: $('setModel').value,
@@ -1168,10 +1337,21 @@
       bootstrapB: Number($('setBootstrapB').value) || 4000,
       alpha: Number($('setAlpha').value) || 0.05,
       maxTokens: Number($('setMaxTokens').value) || 16000,
+      cloudUrl: cloudUrl,
+      cloudKey: $('setCloudKey').value.trim(),
+      cloudCode: $('setCloudCode').value,
+      cloudMode: $('setCloudMode').value,
     });
-    toast('设置已保存', 'ok');
-    closeSettings();
+    // 地址被换算过则回填，让用户看到实际使用的地址
+    if (cloudUrl && cloudUrl !== cloudUrlRaw) $('setCloudUrl').value = cloudUrl;
+    if (!quiet) toast('设置已保存', 'ok');
+    if (!quiet) closeSettings();
     if (state.result) renderResult();
+    updateCloudStatus();
+    // 连接信息发生变化时清掉旧会话，避免用旧项目的令牌访问新项目
+    if (before.cloudUrl !== cloudUrl || before.cloudKey !== $('setCloudKey').value.trim()) {
+      CL.disconnect();
+    }
   }
 
   function openData() { renderProjectAdmin(); $('dataMask').hidden = false; }
@@ -1248,6 +1428,9 @@
       }
       banner('');
       toast('已切换到项目「' + (p ? p.name : '') + '」', 'ok');
+      // 切换项目时静默拉取一次，保证看到的是云端最新数据
+      const st = S.getSettings();
+      if ((st.cloudMode || 'dual') !== 'local' && CL.isConfigured(st)) cloudPull({ quiet: true });
     });
 
     $('btnNewProject').addEventListener('click', () => {
@@ -1308,6 +1491,49 @@
       } catch (e) {
         out.textContent = '✗ ' + e.message;
       }
+    });
+
+    /* ---------- 云端 ---------- */
+    $('btnCloudConnect').addEventListener('click', async () => {
+      const out = $('cloudTestResult');
+      const urlRaw = $('setCloudUrl').value.trim();
+      if (!urlRaw) { out.textContent = '请先填写 Supabase URL。'; return; }
+      const url = CL.normalizeUrl(urlRaw);
+      $('setCloudUrl').value = url;
+      const key = $('setCloudKey').value.trim();
+      const code = $('setCloudCode').value;
+      if (!key) { out.textContent = '请先填写 anon public key。'; return; }
+      if (!code) { out.textContent = '请先填写访问码。'; return; }
+      if (/service_role/i.test(key)) {
+        out.textContent = '✗ 这是 service_role key，请改用 anon public key（它拥有完全控制权，泄漏风险极高）。';
+        return;
+      }
+      out.textContent = '连接中…';
+      try {
+        // 先落盘设置，再连接
+        $('setCloudKey').value = key;
+        saveSettingsFromForm({ quiet: true });
+        const r = await CL.connect(S.getSettings());
+        out.textContent = '✓ 已连接（成员标识 ' + (r.userId ? r.userId.slice(0, 8) : '—') + '）';
+        updateCloudStatus();
+        await cloudPull({ quiet: true });
+        toast('云端已连接，数据已拉取', 'ok');
+      } catch (e) {
+        out.textContent = '✗ ' + e.message;
+        updateCloudStatus(e.message);
+      }
+    });
+
+    $('btnCloudPull').addEventListener('click', () => { cloudPull(); });
+
+    $('btnCloudDisconnect').addEventListener('click', () => {
+      if (!window.confirm('断开云端？本机已保存的数据不受影响，之后不再同步到云端。')) return;
+      CL.disconnect();
+      S.saveSettings({ cloudMode: 'local' });
+      $('setCloudMode').value = 'local';
+      $('cloudTestResult').textContent = '已断开。若要再次启用，请把同步方式改回「双写」并重新连接。';
+      updateCloudStatus();
+      toast('已断开云端，当前为纯本地模式', 'ok');
     });
 
     $('btnData').addEventListener('click', openData);
@@ -1383,6 +1609,13 @@
     updateCmSum();
     renderResult();
     renderHistory();
+    updateCloudStatus();
+
+    // 已配置云端则启动时自动拉取一次（静默，失败只提示不打断）
+    const settings = S.getSettings();
+    if ((settings.cloudMode || 'dual') !== 'local' && CL.isConfigured(settings)) {
+      cloudPull({ quiet: true }).then(() => renderProjectSelect());
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
