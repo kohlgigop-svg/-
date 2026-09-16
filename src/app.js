@@ -1361,7 +1361,7 @@
       s.aiProxyUrl ? '经服务端代理（密钥不在浏览器中）'
         : (s.apiKey ? '本机 API Key 直连' : '未配置'),
       !!(s.aiProxyUrl || s.apiKey));
-    row('模型', s.model || '—', !!s.model);
+    // 模型不在此重复展示——下方「云端共享」区已有可切换的模型选择
   }
 
   function openSettings() {

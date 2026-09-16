@@ -277,7 +277,7 @@ canvas { max-width: 100%; }
 .modal-mask[hidden] { display: none; }
 .modal {
   background: var(--surface); border-radius: var(--radius); width: 100%; max-width: 560px;
-  max-height: 88vh; display: flex; flex-direction: column; box-shadow: 0 12px 40px rgba(0,0,0,.22);
+  max-height: 92vh; display: flex; flex-direction: column; box-shadow: 0 12px 40px rgba(0,0,0,.22);
 }
 .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
 .modal-body { padding: 16px 18px; overflow-y: auto; }

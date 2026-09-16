@@ -275,27 +275,32 @@ async function main() {
     ok(norm === 'https://ofdtgchdkhgvksuohzoq.supabase.co',
       '控制台地址被自动换算为接口地址', norm);
 
-    // 6.2 通过界面配置并连接
+    // 6.2 通过界面连接（凭据来自 config.js，界面已无输入框）
     const connectRes = await cdp.eval(`
       return (async () => {
         document.getElementById('btnSettings').click();
-        document.getElementById('setCloudUrl').value = '${SUPABASE_DASH}';
-        document.getElementById('setCloudKey').value = '${SUPABASE_ANON}';
-        document.getElementById('setCloudCode').value = 'qc-eval-2026';
-        document.getElementById('setCloudMode').value = 'dual';
+        await new Promise(r => setTimeout(r, 300));
+        const modal = document.getElementById('settingsMask');
+        const credentialInputs = ['setApiKey', 'setCloudUrl', 'setCloudKey', 'setCloudCode', 'setAiProxyUrl']
+          .filter((id) => document.getElementById(id) !== null);
+        const infoText = (document.getElementById('deployInfo') || {}).textContent || '';
         document.getElementById('btnCloudConnect').click();
-        await new Promise(r => setTimeout(r, 9000));
+        await new Promise(r => setTimeout(r, 10000));
         return {
           testResult: document.getElementById('cloudTestResult').textContent,
-          urlField: document.getElementById('setCloudUrl').value,
           connected: window.QCCloud.isConnected(window.QCStore.getSettings()),
+          credentialInputs: credentialInputs,
+          infoText: infoText,
+          leaksInDom: modal.innerHTML.indexOf('sk-') >= 0,
         };
       })();
     `);
-    ok(/✓/.test(connectRes.testResult), '界面上「测试并连接」成功', connectRes.testResult);
-    ok(connectRes.urlField === 'https://ofdtgchdkhgvksuohzoq.supabase.co',
-      '设置里回填了换算后的 URL', connectRes.urlField);
+    ok(/✓/.test(connectRes.testResult), '界面上「连接云端」成功', connectRes.testResult);
     ok(connectRes.connected === true, '前端判定为已连接');
+    ok(connectRes.credentialInputs.length === 0,
+      '线上设置界面不含任何凭据输入框', connectRes.credentialInputs.join(', '));
+    ok(connectRes.leaksInDom === false, '线上设置界面 DOM 中不含 sk- 形式密钥');
+    ok(/ref[：:]/.test(connectRes.infoText), '部署信息显示项目 ref（公开信息）', connectRes.infoText.slice(0, 120));
 
     await cdp.eval(`document.getElementById('btnCloseSettings').click(); return 1;`);
     await sleep(400);
