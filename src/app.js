@@ -609,15 +609,18 @@
     head.appendChild(btn);
 
     const st = el('span', 'ai-status');
+    const proxyUi = !!(settings.aiProxyUrl && settings.aiProxyUrl.trim());
     if (state.aiLoading) {
       const sp = el('span', 'spinner');
       st.appendChild(sp);
-      st.appendChild(document.createTextNode(' 正在请求 ' + (settings.model || 'deepseek-flash') + ' …'));
-    } else if (!settings.apiKey) {
-      st.textContent = '未配置 API Key，点击右上角「设置」填入后即可使用。';
+      st.appendChild(document.createTextNode(' 正在请求 ' + (settings.model || 'deepseek-flash')
+        + (proxyUi ? '（经服务端代理）' : '') + ' …'));
+    } else if (!proxyUi && !settings.apiKey) {
+      st.textContent = '未配置 AI 调用方式：请联系管理员配置代理地址，或在「设置」中填入 API Key。';
     } else if (state.aiResult) {
       const r = state.aiResult;
       const bits = ['模型 ' + r.model,
+        r.viaProxy ? '服务端代理' : '本机 Key 直连',
         '耗时 ' + (r.elapsedMs / 1000).toFixed(1) + ' s',
         '预算 ' + r.maxTokens];
       if (r.reasoningTokens !== null && r.reasoningTokens !== undefined) bits.push('思维链 ' + r.reasoningTokens + ' token');
@@ -633,6 +636,10 @@
       }
     } else if (state.aiError) {
       st.textContent = '上次调用失败：' + state.aiError;
+    } else if (proxyUi) {
+      // 已启用代理但本次还没分析：必须明确标注「服务端代理」，否则用户以为没配置
+      st.textContent = '模型 ' + (settings.model || 'deepseek-flash')
+        + '　经服务端代理调用（API Key 不在浏览器里）　将依据上方指标与诊断卡生成根因分析与动作建议。';
     } else {
       st.textContent = '模型 ' + (settings.model || 'deepseek-flash') + '　将依据上方指标与诊断卡生成根因分析与动作建议。';
     }
@@ -1260,8 +1267,9 @@
   async function runAI() {
     if (!state.result) { toast('请先计算。', 'err'); return; }
     const settings = S.getSettings();
-    if (!settings.apiKey) {
-      toast('未配置 API Key，请先在「设置」中填写。', 'err');
+    const useProxy = !!(settings.aiProxyUrl && settings.aiProxyUrl.trim());
+    if (!useProxy && !settings.apiKey) {
+      toast('未配置 AI 调用方式：请让管理员配置代理地址，或在「设置」中填入 API Key。', 'err');
       openSettings();
       return;
     }
@@ -1272,6 +1280,9 @@
       const ctx = state.result.ctx;
       state.lastPrompt = AI.buildUserPayload(ctx);
       const res = await AI.analyze(ctx, {
+        proxyUrl: settings.aiProxyUrl,
+        accessCode: settings.cloudCode,
+        sessionToken: CL.sessionToken ? CL.sessionToken() : null,
         apiKey: settings.apiKey,
         model: settings.model,
         apiBase: settings.apiBase,
@@ -1283,7 +1294,7 @@
       } else if (res.repaired) {
         toast('模型返回的 JSON 存在残缺，已自动修复后展示。', 'err');
       } else {
-        toast('分析已生成', 'ok');
+        toast('分析已生成' + (res.viaProxy ? '（经服务端代理）' : ''), 'ok');
       }
     } catch (e) {
       state.aiError = e.message;
@@ -1314,6 +1325,7 @@
   function openSettings() {
     const s = S.getSettings();
     $('setApiKey').value = s.apiKey || '';
+    $('setAiProxyUrl').value = s.aiProxyUrl || '';
     $('setModel').value = s.model || 'deepseek-flash';
     $('setApiBase').value = s.apiBase || 'https://api.deepseek.com';
     $('setBootstrapB').value = s.bootstrapB || 4000;
@@ -1354,12 +1366,23 @@
     lock('setCloudMode', 'cloudMode');
     lock('setModel', 'model');
     lock('setApiBase', 'apiBase');
+    lock('setAiProxyUrl', 'aiProxyUrl');
     lock('setApiKey', 'apiKey');
-    // AI Key 锁定（即已由服务端代理提供）时，隐藏整块提示
-    const cfg = S.deploymentConfig();
-    const keyLocked = !cfg.allowUserAiKey;
-    const keyHint = $('btnTestKey');
-    if (keyHint) keyHint.disabled = false; // 测试按钮始终可用（便于排查）
+    // 使用代理时，Key 字段整块隐藏（前端根本不需要它）。
+    // 判断依据是「当前生效的设置」，而不是仅看部署配置——
+    // 这样通过配置串导入代理地址时同样能正确隐藏。
+    const eff = S.getSettings();
+    const usingProxy = !!(eff.aiProxyUrl && String(eff.aiProxyUrl).trim());
+    const keyField = $('setApiKey').closest('.field');
+    const testRow = $('btnTestKey').closest('.row-inline');
+    if (keyField) keyField.hidden = usingProxy;
+    if (testRow) testRow.hidden = usingProxy;
+    const hint = $('apiKeyHint');
+    if (hint) {
+      hint.textContent = usingProxy
+        ? '已启用服务端代理，无需 API Key'
+        : '仅在未使用代理时需要；仅保存在本机浏览器';
+    }
   }
   function closeSettings() { $('settingsMask').hidden = true; }
 
@@ -1371,6 +1394,7 @@
     const cloudUrl = cloudUrlRaw ? CL.normalizeUrl(cloudUrlRaw) : '';
     S.saveSettings({
       apiKey: $('setApiKey').value.trim(),
+      aiProxyUrl: CL.normalizeProxyUrl($('setAiProxyUrl').value.trim()),
       model: $('setModel').value,
       apiBase: $('setApiBase').value.trim() || 'https://api.deepseek.com',
       bootstrapB: Number($('setBootstrapB').value) || 4000,

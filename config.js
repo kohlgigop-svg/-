@@ -36,7 +36,13 @@
     cloudCode: 'qc-eval-2026',
     cloudMode: 'dual',
 
-    /* ---------- AI 模型（⚠️ 不要在此填 Key，见上方说明） ---------- */
+    /* ---------- AI 模型 ---------- */
+    // AI 代理地址：配置后由服务端 Edge Function 调用模型，
+    // 前端与仓库中都不再需要 API Key（推荐，也是零输入方案）
+    // 部署方法见 supabase/README.md「方案 C」
+    aiProxyUrl: 'https://ofdtgchdkhgvksuohzoq.supabase.co/functions/v1/ai-proxy',
+
+    // ⚠️ 仅在「不使用代理」时才需要；使用代理时请保持为空
     aiKey: '',
     aiModel: 'deepseek-flash',
     aiBase: 'https://api.deepseek.com',

@@ -152,6 +152,77 @@ select public.qc_fetch_all('你的访问码');       -- 期望 []
 
 ---
 
+## 方案 C：Edge Function 代理 AI 调用（API Key 不落前端，全员零输入）
+
+这是最推荐的部署方式：**DeepSeek 的 API Key 只存在于 Supabase 服务端**，前端、仓库、浏览器里都不出现，
+成员打开页面即可使用 AI 分析，**不需要填任何东西**。
+
+### 为什么需要它
+
+前端直连模型时，Key 必然存在于浏览器里，任何人 F12 就能抄走并消耗你的额度。
+把调用搬到服务端后，浏览器只发请求给 Edge Function，Key 由服务端注入。
+
+### 部署步骤（控制台操作，约 5 分钟）
+
+**1. 创建函数**
+
+1. Supabase 控制台 → 左侧 **Edge Functions**
+2. 点 **Deploy a new function** → 选 **Via Editor**（不要选 CLI）
+3. 函数名填：`ai-proxy`（**必须完全一致**）
+4. 把 `supabase/functions/ai-proxy/index.ts` 的内容**全文粘贴**进编辑器
+5. 点 **Deploy**，等状态变成 `ACTIVE`
+
+> 若编辑器不支持相对路径 import（`./handler.js`），把 `handler.js` 的内容也一起粘进
+> `index.ts`（把 `import` 那行删掉，两个文件拼成一个即可）。
+
+**2. 添加四个密钥（Secrets）**
+
+在 Edge Functions 页面 → **Secrets**（或 Project Settings → Edge Functions → Secrets），逐个添加：
+
+| 名称 | 值 |
+|---|---|
+| `DEEPSEEK_API_KEY` | `sk-` 开头的真实 Key |
+| `ACCESS_CODE_HASH` | `2b3ac575436c0f15e2eae20a595c9b868fe47c3e0bd5c9228a870adbcf8af5d1` |
+| `SUPABASE_URL` | `https://ofdtgchdkhgvksuohzoq.supabase.co` |
+| `SUPABASE_ANON_KEY` | 你的 anon public key |
+
+> `ACCESS_CODE_HASH` 就是访问码 `qc-eval-2026` 的 SHA-256，与数据库里用的**是同一个哈希**。
+> 若你改过访问码，用同样的方法重新算（见文首说明）。
+
+**3. 确认前端指向代理**
+
+`config.js` 里的 `aiProxyUrl` 已经填好：
+
+```
+https://ofdtgchdkhgvksuohzoq.supabase.co/functions/v1/ai-proxy
+```
+
+管理员在本机「设置 → AI 分析」里也能看到这一项（已锁定，成员不可改）。
+工具会自动识别为「服务端代理」模式，并**隐藏 API Key 输入框**——因为已经不需要了。
+
+### 安全设计（本函数已实现并有测试覆盖）
+
+| 机制 | 作用 |
+|---|---|
+| Key 只在服务端环境变量 | 响应体中任何情况下都不含 Key（有专门测试断言） |
+| 访问码在服务端比对 SHA-256 | 明文访问码既不进数据库也不进代码 |
+| 校验 Supabase 会话 | 必须带有效匿名登录令牌，提高滥用门槛 |
+| 模型白名单 | 只允许 `deepseek-flash` / `deepseek-v4-pro`，防止被拿去调其它昂贵模型 |
+| `max_tokens` 上限 32000 | 防止有人用超大预算刷额度 |
+| 请求体上限 256 KB | 防止超大请求 |
+| CORS 白名单 | 只允许你自己的站点来源，未知来源不回显 |
+
+### 验证部署是否成功
+
+在浏览器打开你的工具页面 → 「设置」→ 关掉再打开，确认「AI 代理地址」已填好且不可编辑；
+然后点结果区的「生成分析」。成功时状态行会显示 **「服务端代理」** 字样。
+
+若失败，状态行会给出去向明确的提示（如 `NO_SESSION` 会提示先去连云端取得会话）。
+
+> 仍需做的最后一道保险：到 DeepSeek 控制台**设置每月消费上限**。
+
+---
+
 ## 日常运维（长期使用必读）
 
 ### 孤儿数据：唯一需要人工介入的情形

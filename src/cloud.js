@@ -35,6 +35,25 @@
     return u;
   }
 
+  /**
+   * 归一化 AI 代理地址。
+   * 不能用 normalizeUrl：那个函数会把路径截掉（如 /functions/v1/ai-proxy 会丢失）。
+   * 这里只做三件事：去空白、去尾部斜杠、把控制台地址补成完整函数地址。
+   */
+  function normalizeProxyUrl(input) {
+    let u = String(input || '').trim().replace(/\/+$/, '');
+    if (!u) return '';
+    // 用户误填控制台地址 → 补成默认函数路径
+    const dash = u.match(/supabase\.com\/dashboard\/project\/([a-z0-9]+)/i);
+    if (dash) return 'https://' + dash[1] + '.supabase.co/functions/v1/ai-proxy';
+    // 只填了项目 ref → 补全
+    if (/^[a-z0-9]{15,}$/i.test(u)) return 'https://' + u + '.supabase.co/functions/v1/ai-proxy';
+    // 填了项目域名但没带路径 → 补默认函数路径
+    const host = u.match(/^https?:\/\/([a-z0-9]+)\.supabase\.co$/i);
+    if (host) return 'https://' + host[1] + '.supabase.co/functions/v1/ai-proxy';
+    return u;
+  }
+
   function isConfigured(settings) {
     const c = cfgFrom(settings);
     return !!(c.url && c.key && c.code);
@@ -163,6 +182,12 @@
   function currentUserId() {
     const s = loadSession();
     return s ? s.user_id : null;
+  }
+
+  /** 当前会话令牌（用于调用需要身份的服务端函数，如 AI 代理） */
+  function sessionToken() {
+    const s = loadSession();
+    return s ? s.access_token : null;
   }
 
   /* ---------------------------------------------------------------------------
@@ -310,6 +335,7 @@
 
   global.QCCloud = {
     normalizeUrl: normalizeUrl,
+    normalizeProxyUrl: normalizeProxyUrl,
     isConfigured: isConfigured,
     isConnected: isConnected,
     connect: connect,
@@ -321,6 +347,7 @@
     renameProject: renameProject,
     syncToLocal: syncToLocal,
     currentUserId: currentUserId,
+    sessionToken: sessionToken,
     humanize: humanize,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = global.QCCloud;

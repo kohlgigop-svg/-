@@ -6,6 +6,7 @@ const path = require('path');
 const suites = [
   ['内核单元测试', 'core.test.js'],
   ['集成测试', 'integration.test.js'],
+  ['AI 代理逻辑', 'ai-proxy.test.js'],
   ['浏览器端到端', 'browser.e2e.js'],
   ['渲染验证', 'render.test.js'],
   ['云端端到端（需 Supabase）', 'cloud.test.js'],

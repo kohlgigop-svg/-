@@ -71,6 +71,8 @@
 
   const DEFAULT_SETTINGS = {
     apiKey: '',
+    // AI 代理地址：配置后由服务端调用模型，前端不再需要 API Key（推荐）
+    aiProxyUrl: '',
     model: 'deepseek-flash',
     apiBase: 'https://api.deepseek.com',
     // deepseek-flash 为推理模型，思维链与正文共用 max_tokens，故预算须留足余量
@@ -102,13 +104,16 @@
   function configToSettings(cfg) {
     const map = {
       cloudUrl: 'cloudUrl', cloudKey: 'cloudKey', cloudCode: 'cloudCode', cloudMode: 'cloudMode',
-      aiKey: 'apiKey', aiModel: 'model', aiBase: 'apiBase', aiMaxTokens: 'maxTokens',
+      aiKey: 'apiKey', aiProxyUrl: 'aiProxyUrl', aiModel: 'model', aiBase: 'apiBase', aiMaxTokens: 'maxTokens',
       acceptAccuracy: 'acceptAccuracy', obsWindow: 'obsWindow', alpha: 'alpha', bootstrapB: 'bootstrapB',
     };
     const out = {};
     Object.keys(map).forEach((k) => {
       const v = cfg[k];
-      if (v === undefined || v === null || v === '') return;
+      if (v === undefined || v === null) return;
+      // 允许用空字符串显式覆盖（用于关闭某功能，例如置空 aiProxyUrl 关闭代理）
+      // 其余类型的空值视为未配置，不覆盖内置默认
+      if (v === '' && typeof cfg[k] !== 'string') return;
       out[map[k]] = v;
     });
     return out;
@@ -121,8 +126,13 @@
     const locked = {
       cloudUrl: cfg.cloudUrl, cloudKey: cfg.cloudKey, cloudCode: cfg.cloudCode,
       cloudMode: cfg.cloudMode, apiBase: cfg.aiBase, model: cfg.aiModel,
+      aiProxyUrl: cfg.aiProxyUrl,
     };
-    if (key === 'apiKey') return !cfg.allowUserAiKey;
+    if (key === 'apiKey') {
+      // 已配置代理时，前端不再需要 Key，直接锁定；否则按 allowUserAiKey 决定
+      if (cfg.aiProxyUrl) return true;
+      return !cfg.allowUserAiKey;
+    }
     return !!locked[key];
   }
 
@@ -505,7 +515,7 @@
 
   /** 需要随配置串分发的字段 */
   const CONFIG_KEYS = [
-    'apiKey', 'model', 'apiBase', 'maxTokens',
+    'apiKey', 'aiProxyUrl', 'model', 'apiBase', 'maxTokens',
     'cloudUrl', 'cloudKey', 'cloudCode', 'cloudMode',
     'acceptAccuracy', 'obsWindow', 'alpha', 'bootstrapB',
   ];

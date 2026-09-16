@@ -13,6 +13,7 @@ const ROOT = path.join(__dirname, '..');
 const SHOT_DIR = path.join(ROOT, 'test', 'screenshots');
 const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const PORT = 8791;
+const PORT_NO_PROXY = 8792;   // 用于验证「未配置代理」形态的独立服务
 const CDP_PORT = 9333;
 const USER_DATA = path.join(ROOT, 'test', '.chrome-profile');
 
@@ -65,6 +66,10 @@ const TEST_CONFIG_JS = `/*
     cloudKey: 'test-anon-key-for-locking-check-only',
     cloudCode: 'test-deploy-code',
     cloudMode: 'local',
+    // 代理地址必须是「格式正确且可解析」的地址，否则页面会产生 ERR_NAME_NOT_RESOLVED。
+    // 这里用本地服务上真实存在的路径，仅用于验证「已配置代理」的界面行为；
+    // 测试中不会真的调用它。
+    aiProxyUrl: 'http://127.0.0.1:8791/favicon.svg',
     aiKey: '',
     aiModel: 'deepseek-flash',
     aiBase: 'https://api.deepseek.com',
@@ -79,14 +84,20 @@ const TEST_CONFIG_JS = `/*
 })(typeof globalThis !== 'undefined' ? globalThis : this);
 `;
 
-function startServer() {
+/** 未配置 AI 代理的部署形态（用于验证「需要填 Key」的界面行为） */
+const TEST_CONFIG_NO_PROXY_JS = TEST_CONFIG_JS
+  .replace(/aiProxyUrl: '[^']*',/, "aiProxyUrl: '',");
+
+function startServer(port, mode) {
+  const usePort = port || PORT;
+  const configJs = mode === 'no-proxy' ? TEST_CONFIG_NO_PROXY_JS : TEST_CONFIG_JS;
   const server = http.createServer((req, res) => {
     let p = decodeURIComponent(req.url.split('?')[0]);
     if (p === '/') p = '/index.html';
 
     if (p === '/config.js') {
       res.writeHead(200, { 'Content-Type': MIME['.js'] });
-      res.end(TEST_CONFIG_JS);
+      res.end(configJs);
       return;
     }
 
@@ -97,7 +108,7 @@ function startServer() {
     res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
     fs.createReadStream(file).pipe(res);
   });
-  return new Promise((resolve) => server.listen(PORT, '127.0.0.1', () => resolve(server)));
+  return new Promise((resolve) => server.listen(usePort, '127.0.0.1', () => resolve(server)));
 }
 
 /* ---------------- 极简 CDP 客户端 ---------------- */
@@ -336,19 +347,11 @@ async function main() {
                hasPromptFn: typeof window.QCAI.buildUserPayload };
     `);
     ok(aiInfo.btnText === '生成分析', 'AI 按钮已渲染', aiInfo.btnText);
-    ok(/未配置 API Key/.test(aiInfo.status || ''), '未配置 Key 时给出明确提示', aiInfo.status);
+    ok(/服务端代理/.test(aiInfo.status || ''),
+      '默认（部署配置启用代理）时状态行标注服务端代理', aiInfo.status);
     ok(aiInfo.hasPromptFn === 'function', '提示词构建函数可用');
 
-    // 点击 AI 按钮应提示去设置，而不是报错
-    await cdp.eval(`document.getElementById('btnRunAI').click(); return 1;`);
-    await sleep(400);
-    const aiAfter = await cdp.eval(`
-      const m = document.getElementById('settingsMask');
-      return { settingsOpen: !m.hidden, toast: (document.querySelector('.toast')||{}).textContent || '' };
-    `);
-    ok(aiAfter.settingsOpen === true, '未配置 Key 时自动打开设置面板');
-    await cdp.eval(`document.getElementById('btnCloseSettings').click(); return 1;`);
-    await sleep(200);
+    // 未配置调用方式时点按钮 → 应打开设置面板（详细行为在 5b 中验证）
 
     /* ---------- 保存记录 ---------- */
     console.log('\n=== 6. 保存记录与历史 ===');
@@ -574,7 +577,8 @@ async function main() {
     ok(deploy.ui.cloudKey.value === 'test-anon-key-for-locking-check-only', '设置面板里 anon key 已自动填好');
     ok(deploy.ui.cloudUrl.disabled === true, 'URL 字段被锁定（防止成员误改）');
     ok(deploy.ui.cloudCode.disabled === true, '访问码字段被锁定');
-    ok(deploy.ui.apiKey.disabled === false, 'AI Key 字段仍可编辑（按设计不写死）');
+    ok(deploy.ui.apiKey.disabled === true || deploy.ui.apiKey.hidden === true,
+      'AI Key 字段：启用代理时隐藏或锁定（前端不需要 Key）', JSON.stringify(deploy.ui.apiKey));
     ok(deploy.lockedTags >= 4, '界面标注了「由部署方统一配置」', String(deploy.lockedTags));
 
     /* ---------- 配置串导出/导入 ---------- */
@@ -617,6 +621,94 @@ async function main() {
 
     await cdp.eval(`document.getElementById('btnCloseSettings').click(); return 1;`);
     await sleep(300);
+
+    /* ---------- 服务端代理模式（方案 C）---------- */
+    console.log('\n=== 5b. AI 服务端代理模式（Key 不落前端）===');
+    const proxyMode = await cdp.eval(`
+      return (async () => {
+        // 部署配置里已带代理地址（见文件顶部 TEST_CONFIG_JS），此处只验证其效果
+        document.getElementById('btnCalc').click();
+        await new Promise(r => setTimeout(r, 500));
+        document.getElementById('btnSettings').click();
+        await new Promise(r => setTimeout(r, 200));
+        const keyField = document.getElementById('setApiKey').closest('.field');
+        const testRow = document.getElementById('btnTestKey').closest('.row-inline');
+        const result = {
+          proxyValue: document.getElementById('setAiProxyUrl').value,
+          keyFieldHidden: keyField.hidden,
+          testRowHidden: testRow.hidden,
+          hint: (document.getElementById('apiKeyHint') || {}).textContent || '',
+        };
+        document.getElementById('btnCloseSettings').click();
+        await new Promise(r => setTimeout(r, 300));
+        result.status = (document.querySelector('#resultZone .ai-status') || {}).textContent || '';
+        return result;
+      })();
+    `);
+    ok(/ai-proxy|favicon/.test(proxyMode.proxyValue),
+      '代理地址已在设置面板中填好（管理员配置，成员无需输入）', proxyMode.proxyValue);
+    ok(proxyMode.keyFieldHidden === true,
+      '启用代理后，API Key 输入框整块隐藏（前端已不需要 Key）');
+    ok(proxyMode.testRowHidden === true, '启用代理后，Key 测试按钮一并隐藏');
+    ok(/已启用服务端代理/.test(proxyMode.hint), '文案说明当前无需 API Key', proxyMode.hint);
+    ok(/服务端代理/.test(proxyMode.status), 'AI 状态行标注为服务端代理', proxyMode.status);
+
+    // 「无代理」形态：另起一个独立服务提供「没有 aiProxyUrl」的部署配置。
+    // 页面内直接改 QC_CONFIG 无效——每次加载 config.js 都会重置，必须换服务。
+    console.log('\n=== 5c. 未配置代理形态（独立服务）===');
+    const noProxyServer = await startServer(PORT_NO_PROXY, 'no-proxy');
+    const noProxyPage = await (await fetch(
+      'http://127.0.0.1:' + CDP_PORT + '/json/new?' + encodeURIComponent('about:blank'),
+      { method: 'PUT' })).json();
+    const ws2 = new WebSocket(noProxyPage.webSocketDebuggerUrl);
+    await new Promise((res, rej) => { ws2.addEventListener('open', res); ws2.addEventListener('error', rej); });
+    const cdp2 = new CDP(ws2);
+    await cdp2.send('Runtime.enable');
+    await cdp2.send('Page.enable');
+    cdp2.onEvent((m) => {
+      if (m.method === 'Page.javascriptDialogOpening') {
+        cdp2.send('Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
+      }
+    });
+    await cdp2.send('Page.navigate', { url: 'http://127.0.0.1:' + PORT_NO_PROXY + '/index.html' });
+    await sleep(2500);
+
+    const noProxy = await cdp2.eval(`
+      return (async () => {
+        const r = { hasCalc: !!document.getElementById('btnCalc') };
+        window.prompt = () => '无代理测试项目';
+        document.getElementById('btnNewProject').click();
+        await new Promise(res => setTimeout(res, 300));
+        document.getElementById('btnSample').click();
+        await new Promise(res => setTimeout(res, 200));
+        document.getElementById('btnCalc').click();
+        await new Promise(res => setTimeout(res, 700));
+        r.effProxy = window.QCStore.getSettings().aiProxyUrl;
+        r.status = (document.querySelector('#resultZone .ai-status') || {}).textContent || '';
+        document.getElementById('btnSettings').click();
+        await new Promise(res => setTimeout(res, 250));
+        const keyField = document.getElementById('setApiKey').closest('.field');
+        r.keyFieldHidden = keyField.hidden;
+        r.hint = (document.getElementById('apiKeyHint') || {}).textContent || '';
+        document.getElementById('btnCloseSettings').click();
+        await new Promise(res => setTimeout(res, 250));
+        const aiBtn = document.getElementById('btnRunAI');
+        r.hasAiBtn = !!aiBtn;
+        if (aiBtn) aiBtn.click();
+        await new Promise(res => setTimeout(res, 700));
+        r.settingsOpened = !document.getElementById('settingsMask').hidden;
+        return r;
+      })();
+    `);
+    ok(noProxy.hasCalc === true, '（无代理形态）页面正常加载');
+    ok(!noProxy.effProxy, '未配置代理时生效设置中无代理地址', String(noProxy.effProxy));
+    ok(noProxy.keyFieldHidden === false, '未配置代理时，API Key 字段可见');
+    ok(/仅在未使用代理时需要/.test(noProxy.hint), '提示说明 Key 仅在无代理时需要', noProxy.hint);
+    ok(/未配置 AI 调用方式/.test(noProxy.status), '状态行提示需配置调用方式', noProxy.status);
+    ok(noProxy.hasAiBtn === true, '（无代理形态）AI 卡片已渲染');
+    ok(noProxy.settingsOpened === true, '未配置调用方式时点「生成分析」自动打开设置面板');
+    try { ws2.close(); } catch (e) { /* 忽略 */ }
+    noProxyServer.close();
 
     /* ---------- 收尾错误检查 ---------- */
     console.log('\n=== 13. 全程错误检查 ===');

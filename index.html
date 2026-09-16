@@ -283,8 +283,13 @@
       <button class="icon-btn" id="btnCloseSettings" type="button" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
+      <div class="subhead"><h3>AI 分析</h3></div>
       <label class="field">
-        <span>API Key<em>仅保存在本机浏览器，不会写入代码或上传</em></span>
+        <span>AI 代理地址<em>由服务端调用模型，前端无需 API Key（推荐）</em></span>
+        <input type="text" id="setAiProxyUrl" placeholder="https://xxxx.supabase.co/functions/v1/ai-proxy" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>API Key<em id="apiKeyHint">仅在未使用代理时需要；仅保存在本机浏览器</em></span>
         <div class="row-inline">
           <input type="password" id="setApiKey" placeholder="sk-..." autocomplete="off">
           <button class="btn btn-mini" id="btnToggleKey" type="button">显示</button>

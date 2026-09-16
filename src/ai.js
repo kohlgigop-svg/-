@@ -401,8 +401,14 @@
    */
   async function analyze(ctx, opts) {
     opts = opts || {};
-    const apiKey = (opts.apiKey || '').trim();
-    if (!apiKey) throw new Error('未配置 API Key。请点击右上角「设置」填入后再试。');
+    const proxyUrl = String(opts.proxyUrl || '').trim();
+    const apiKey = String(opts.apiKey || '').trim();
+
+    // 走服务端代理时不需要前端持有 Key（Key 只在 Edge Function 的环境变量里）
+    if (!proxyUrl && !apiKey) {
+      throw new Error('未配置 AI 调用方式。请联系管理员配置代理地址，或在「设置」中填入 API Key。');
+    }
+
     const base = (opts.apiBase || 'https://api.deepseek.com').replace(/\/+$/, '');
     const model = opts.model || 'deepseek-flash';
     const messages = [
@@ -410,13 +416,14 @@
       { role: 'user', content: buildUserPayload(ctx) },
     ];
 
+    const send = (maxTokens) => (proxyUrl
+      ? requestViaProxy({ proxyUrl, accessCode: opts.accessCode, sessionToken: opts.sessionToken,
+        model, messages, maxTokens, temperature: opts.temperature, signal: opts.signal })
+      : requestOnce({ base, apiKey, model, messages, maxTokens,
+        temperature: opts.temperature, signal: opts.signal }));
+
     const started = Date.now();
-    let attempt = await requestOnce({
-      base, apiKey, model, messages,
-      maxTokens: opts.maxTokens || DEFAULT_MAX_TOKENS,
-      temperature: opts.temperature,
-      signal: opts.signal,
-    });
+    let attempt = await send(opts.maxTokens || DEFAULT_MAX_TOKENS);
 
     // 被长度上限截断 → 加大预算重试一次
     // 注意：推理模型的思维链长度波动很大（实测同一输入 4165~8683 token），
@@ -424,13 +431,8 @@
     let retried = false;
     if (attempt.truncated) {
       retried = true;
-      const bigger = await requestOnce({
-        base, apiKey, model, messages,
-        maxTokens: Math.min(MAX_MAX_TOKENS, Math.round(attempt.maxTokens * 2.2) + 8000),
-        temperature: opts.temperature,
-        signal: opts.signal,
-      });
-      // 取内容更完整的一次
+      const bigger = await send(
+        Math.min(MAX_MAX_TOKENS, Math.round(attempt.maxTokens * 2.2) + 8000));
       if (!bigger.truncated || bigger.content.length > attempt.content.length) attempt = bigger;
     }
 
@@ -447,10 +449,65 @@
       reasoningTokens: attempt.reasoningTokens,
       maxTokens: attempt.maxTokens,
       model: model,
+      viaProxy: !!proxyUrl,
       elapsedMs: elapsed,
       usage: attempt.usage,
       promptChars: messages[1].content.length,
       promptPreview: messages[1].content.length,
+    };
+  }
+
+  /** 经 Supabase Edge Function 代理调用（API Key 只存服务端，前端与仓库中都没有） */
+  async function requestViaProxy(o) {
+    const body = {
+      accessCode: o.accessCode || '',
+      model: o.model,
+      messages: o.messages,
+      temperature: o.temperature === undefined ? 0.3 : o.temperature,
+      max_tokens: o.maxTokens,
+    };
+    const headers = { 'Content-Type': 'application/json' };
+    if (o.sessionToken) headers.Authorization = 'Bearer ' + o.sessionToken;
+
+    let resp;
+    try {
+      resp = await fetch(o.proxyUrl, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body),
+        signal: o.signal,
+      });
+    } catch (e) {
+      throw new Error('请求代理失败（网络或跨域问题）：' + e.message);
+    }
+
+    const text = await resp.text();
+    if (!resp.ok) {
+      let msg = text.slice(0, 300);
+      try {
+        const j = JSON.parse(text);
+        if (j.error) msg = j.error;
+      } catch (e) { /* 保持原文 */ }
+      const hint = /NO_SESSION/.test(msg)
+        ? '（提示：请先在「设置 → 云端共享」点「测试并连接」，让浏览器取得会话）'
+        : /ACCESS_DENIED/.test(msg) ? '（提示：访问码与服务端不一致）' : '';
+      throw new Error('代理返回 ' + resp.status + '：' + msg + hint);
+    }
+
+    let payload;
+    try { payload = JSON.parse(text); } catch (e) { throw new Error('代理返回不是合法 JSON。'); }
+    const choice = payload.choices && payload.choices[0];
+    if (!choice || !choice.message) throw new Error('代理返回缺少 choices[0].message。');
+
+    const usage = payload.usage || {};
+    return {
+      content: choice.message.content || '',
+      finishReason: choice.finish_reason || '',
+      truncated: choice.finish_reason === 'length',
+      maxTokens: o.maxTokens,
+      usage: usage,
+      reasoningTokens: usage.completion_tokens_details
+        ? usage.completion_tokens_details.reasoning_tokens : null,
     };
   }
 
