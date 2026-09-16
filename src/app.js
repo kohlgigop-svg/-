@@ -105,9 +105,9 @@
     }
     if (CL.isConnected(settings)) {
       const uid = CL.currentUserId();
+      const modeText = mode === 'cloud' ? '仅云端' : '本地 + 云端双写';
       el2.className = 'banner banner-ok';
-      el2.textContent = '云端已连接（' + mode === 'cloud' ? '仅云端' : '本地 + 云端双写'
-        + '）　成员标识 ' + (uid ? uid.slice(0, 8) : '—')
+      el2.textContent = '云端已连接（' + modeText + '）　成员标识 ' + (uid ? uid.slice(0, 8) : '—')
         + '　提交者本人可修订与删除自己的记录。';
       el2.hidden = false;
       return;

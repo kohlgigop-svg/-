@@ -240,10 +240,141 @@ async function main() {
     ok(cors.status === 401 || cors.status === 400,
       '无效 Key 返回鉴权错误（证明请求真正到达接口）', 'HTTP ' + cors.status + ' ' + String(cors.body).slice(0, 80));
 
-    console.log('\n=== 6. 线上错误检查 ===');
+    console.log('\n=== 6. 线上云端链路（真实浏览器 → 真实 Supabase）===');
+    const SUPABASE_DASH = 'https://supabase.com/dashboard/project/ofdtgchdkhgvksuohzoq';
+    const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9mZHRnY2hka2hndmtzdW9oem9xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk1MTkwOTcsImV4cCI6MjEwNTA5NTA5N30.7tZhOUgN-VOLjUUzZveHrnEKECTZhEI7-DFXoUq3xRw';
+    const TEST_PROJECT = '__E2E_LIVE_PROJECT__' + Date.now().toString(36);
+    const TEST_PERIOD = 'LIVE-' + Date.now().toString(36);
+
+    // 6.1 URL 自动换算：故意填控制台地址
+    const norm = await cdp.eval(`
+      return window.QCCloud.normalizeUrl('${SUPABASE_DASH}');
+    `);
+    ok(norm === 'https://ofdtgchdkhgvksuohzoq.supabase.co',
+      '控制台地址被自动换算为接口地址', norm);
+
+    // 6.2 通过界面配置并连接
+    const connectRes = await cdp.eval(`
+      return (async () => {
+        document.getElementById('btnSettings').click();
+        document.getElementById('setCloudUrl').value = '${SUPABASE_DASH}';
+        document.getElementById('setCloudKey').value = '${SUPABASE_ANON}';
+        document.getElementById('setCloudCode').value = 'qc-eval-2026';
+        document.getElementById('setCloudMode').value = 'dual';
+        document.getElementById('btnCloudConnect').click();
+        await new Promise(r => setTimeout(r, 9000));
+        return {
+          testResult: document.getElementById('cloudTestResult').textContent,
+          urlField: document.getElementById('setCloudUrl').value,
+          connected: window.QCCloud.isConnected(window.QCStore.getSettings()),
+        };
+      })();
+    `);
+    ok(/✓/.test(connectRes.testResult), '界面上「测试并连接」成功', connectRes.testResult);
+    ok(connectRes.urlField === 'https://ofdtgchdkhgvksuohzoq.supabase.co',
+      '设置里回填了换算后的 URL', connectRes.urlField);
+    ok(connectRes.connected === true, '前端判定为已连接');
+
+    await cdp.eval(`document.getElementById('btnCloseSettings').click(); return 1;`);
+    await sleep(400);
+
+    // 6.3 新建测试项目并保存记录（应写入云端）
+    await cdp.eval(`
+      window.prompt = () => '${TEST_PROJECT}';
+      document.getElementById('btnNewProject').click();
+      return 1;
+    `);
+    await sleep(500);
+    const savedCloud = await cdp.eval(`
+      return (async () => {
+        document.getElementById('periodLabel').value = '${TEST_PERIOD}';
+        document.getElementById('cmTP').value = 72;
+        document.getElementById('cmFP').value = 26;
+        document.getElementById('cmFN').value = 8;
+        document.getElementById('cmTN').value = 894;
+        document.getElementById('sampleTotal').value = 1000;
+        document.getElementById('btnCalc').click();
+        await new Promise(r => setTimeout(r, 600));
+        document.getElementById('btnSave').click();
+        await new Promise(r => setTimeout(r, 6000));
+        return {
+          cloudMode: window.QCStore.getSettings().cloudMode,
+          records: (window.QCStore.getProject(window.QCStore.getCurrentProjectId()).records || []).length,
+        };
+      })();
+    `);
+    ok(savedCloud.cloudMode === 'dual', '同步方式为双写', savedCloud.cloudMode);
+    ok(savedCloud.records === 1, '记录已存到本机', String(savedCloud.records));
+
+    // 6.4 独立性验证：脱离本机缓存，直接查云端确认真的写进去了
+    const cloudVerify = await cdp.eval(`
+      return (async () => {
+        const s = window.QCStore.getSettings();
+        const list = await window.QCCloud.fetchAll(s);
+        const p = list.find(x => x.project_name === '${TEST_PROJECT}');
+        return {
+          found: !!p,
+          records: p ? p.records.length : 0,
+          period: p && p.records[0] ? p.records[0].periodLabel : null,
+          recall: p && p.records[0] && p.records[0].payload
+            ? p.records[0].payload.metrics.recall : null,
+          submitterIsMe: p && p.records[0]
+            ? p.records[0].submitter === window.QCCloud.currentUserId() : null,
+        };
+      })();
+    `);
+    ok(cloudVerify.found === true, '云端独立查询能查到该项目（证明真的写入了数据库）');
+    ok(cloudVerify.records === 1, '云端有 1 条记录', String(cloudVerify.records));
+    ok(cloudVerify.period === TEST_PERIOD, '云端周期正确', cloudVerify.period);
+    ok(Math.abs(cloudVerify.recall - 0.9) < 1e-9, '云端指标数值正确（召回率 90%）', String(cloudVerify.recall));
+    ok(cloudVerify.submitterIsMe === true, '云端记录的提交者标识是本机会话（可正确判定归属）');
+
+    // 6.5 刷新页面后：云端数据应自动恢复（模拟换设备/清缓存）
+    await cdp.eval(`localStorage.removeItem('qceval:projects'); return 1;`);
+    await cdp.send('Page.reload');
+    await sleep(9000);
+    const afterWipe = await cdp.eval(`
+      const list = window.QCStore.listProjects();
+      const p = list.find(x => x.name === '${TEST_PROJECT}');
+      return {
+        projectCount: list.length,
+        found: !!p,
+        records: p ? p.recordCount : 0,
+        cloudStatus: (document.getElementById('cloudStatus') || {}).textContent || '',
+      };
+    `);
+    ok(afterWipe.found === true, '清空本机缓存后刷新，云端项目被自动拉回（数据不丢的关键验证）',
+      '项目数 ' + afterWipe.projectCount);
+    ok(afterWipe.records === 1, '拉回的项目含 1 条记录', String(afterWipe.records));
+    ok(/云端已连接（/.test(afterWipe.cloudStatus), '顶部状态条显示云端已连接（含模式说明）',
+      afterWipe.cloudStatus.slice(0, 90));
+
+    // 6.6 清理云端测试数据
+    const cleaned = await cdp.eval(`
+      return (async () => {
+        const s = window.QCStore.getSettings();
+        const list = await window.QCCloud.fetchAll(s);
+        const p = list.find(x => x.project_name === '${TEST_PROJECT}');
+        if (!p) return { deleted: false, reason: 'not found' };
+        for (const rec of p.records) {
+          await window.QCCloud.deleteRecord(s, rec.id);
+        }
+        await window.QCCloud.deleteProject(s, p.project_id);
+        const after = await window.QCCloud.fetchAll(s);
+        return { deleted: true, remaining: after.filter(x => x.project_name === '${TEST_PROJECT}').length };
+      })();
+    `);
+    ok(cleaned.deleted === true, '云端测试数据已清理');
+    ok(cleaned.remaining === 0, '云端无残留测试项目', String(cleaned.remaining));
+
+    console.log('\n=== 7. 线上错误检查 ===');
     const hardErrors = consoleErrors.filter((e) => !/favicon|401|Failed to load resource.*401/i.test(e));
     ok(hardErrors.length === 0, '线上无控制台 error', hardErrors.slice(0, 3).join(' | '));
     ok(pageErrors.length === 0, '线上无未捕获异常', pageErrors.slice(0, 3).join(' | '));
+
+    // 图标必须真实可取（否则浏览器产生 404 噪声，部署后也不专业）
+    const icon = await fetch(SITE + 'favicon.svg', { signal: AbortSignal.timeout(5000) });
+    ok(icon.status === 200, 'favicon.svg 可访问', 'HTTP ' + icon.status);
 
   } finally {
     try { chrome.kill(); } catch (e) { /* 忽略 */ }
