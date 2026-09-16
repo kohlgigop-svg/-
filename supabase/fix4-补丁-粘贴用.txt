@@ -1,0 +1,95 @@
+﻿-- =============================================================================
+-- 补丁 4：管理员清理支持「按项目 id 列表清理」+ 清理本次测试产生的项目
+-- -----------------------------------------------------------------------------
+-- 为什么需要：
+--   之前 qc_admin_cleanup 只能整体清理名称以 __E2E 开头的项目。
+--   实际使用中可能需要清理**任意指定项目**（例如误建的测试项目、
+--   或某成员离职后遗留的孤儿项目）。
+--   本补丁把参数由单个 uuid 改为 uuid[]，可一次清理多个指定项目。
+--
+-- 使用：
+--   1. Supabase → SQL Editor → New query → 粘贴本文件全文 → Run
+--   2. 末尾的三条 select 会依次执行：先列出项目，再清理指定项目，最后复核
+--
+-- ⚠️ 注意 pg 函数重载：旧签名 (text,text,uuid) 与新签名 (text,text,uuid[]) 会并存。
+--    本补丁会显式删除旧签名，避免调用时歧义。
+-- =============================================================================
+
+-- 1. 删除旧签名（若存在），避免重载歧义
+drop function if exists public.qc_admin_cleanup(text, text, uuid);
+
+-- 2. 新签名：支持按项目 id 列表清理
+create or replace function public.qc_admin_cleanup(
+  p_code        text,
+  p_confirm     text,
+  p_project_ids uuid[] default null
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_records  integer := 0;
+  v_projects integer := 0;
+begin
+  if not qc_access_ok(p_code) then
+    raise exception 'ACCESS_DENIED: 访问码不正确' using errcode = '42501';
+  end if;
+  if p_confirm is distinct from 'CONFIRM_DELETE' then
+    raise exception 'CONFIRM_REQUIRED: 需传入确认串 CONFIRM_DELETE';
+  end if;
+
+  if p_project_ids is null or array_length(p_project_ids, 1) is null then
+    -- 未指定项目：清理所有测试用项目（名称以 __E2E 开头）
+    select count(*) into v_records
+      from qc_records r join qc_projects p on p.id = r.project_id
+     where p.name like '\_\_E2E%' escape '\';
+    delete from qc_projects where name like '\_\_E2E%' escape '\';
+    get diagnostics v_projects = row_count;
+  else
+    select count(*) into v_records from qc_records where project_id = any(p_project_ids);
+    if v_records > 200 then
+      raise exception 'TOO_MANY: 单次最多清理 200 条记录，当前 % 条', v_records;
+    end if;
+    delete from qc_records where project_id = any(p_project_ids);
+    delete from qc_projects where id = any(p_project_ids);
+    get diagnostics v_projects = row_count;
+  end if;
+
+  return jsonb_build_object('deletedRecords', v_records, 'deletedProjects', v_projects);
+end;
+$$;
+
+grant execute on function public.qc_admin_cleanup(text, text, uuid[]) to anon, authenticated;
+
+-- =============================================================================
+-- 3. 查看当前有哪些项目（含记录数），用于确认要清理哪些
+-- =============================================================================
+select p.id as 项目id, p.name as 项目名, count(r.id) as 记录数, p.created_at as 创建时间
+  from public.qc_projects p
+  left join public.qc_records r on r.project_id = p.id
+ group by p.id, p.name, p.created_at
+ order by p.created_at;
+
+-- =============================================================================
+-- 4. 清理测试项目（下方 uuid 已按当前库中实际情况填好）
+--    如需清理别的项目，把 uuid 换掉即可；多个用逗号分隔。
+-- =============================================================================
+select public.qc_admin_cleanup(
+  'qc-eval-2026',
+  'CONFIRM_DELETE',
+  array[
+    (select id from public.qc_projects where name = 'test1'),
+    (select id from public.qc_projects where name = '端到端测试项目'),
+    (select id from public.qc_projects where name = 'GUI-L3_step')
+  ]::uuid[]
+);
+
+-- =============================================================================
+-- 5. 清理后复核（应只剩你自己真正在用的项目）
+-- =============================================================================
+select p.name as 项目名, count(r.id) as 记录数
+  from public.qc_projects p
+  left join public.qc_records r on r.project_id = p.id
+ group by p.name
+ order by p.name;

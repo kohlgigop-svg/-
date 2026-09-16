@@ -50,10 +50,46 @@ async function saveShot(shot, file) {
 }
 
 /* ---------------- 静态服务 ---------------- */
+// 用测试专用配置替换 config.js：
+//   本地测试不应使用真实凭据——否则会往真实 Supabase 写测试数据、消耗真实 AI 额度。
+//   这里返回一份「锁定但指向测试端点」的配置，既能验证部署配置与锁定逻辑，
+//   又不会碰任何真实服务。
+const TEST_CONFIG_JS = `/*
+ * 测试专用配置（由 test/browser.e2e.js 在服务端注入，不会部署）
+ * 目的：验证 config.js 的加载、预填与锁定逻辑，同时与真实服务完全隔离。
+ */
+(function (global) {
+  'use strict';
+  global.QC_CONFIG = {
+    cloudUrl: 'https://test-project.supabase.co',
+    cloudKey: 'test-anon-key-for-locking-check-only',
+    cloudCode: 'test-deploy-code',
+    cloudMode: 'local',
+    aiKey: '',
+    aiModel: 'deepseek-flash',
+    aiBase: 'https://api.deepseek.com',
+    aiMaxTokens: 16000,
+    acceptAccuracy: 0.95,
+    obsWindow: 3,
+    alpha: 0.05,
+    bootstrapB: 4000,
+    lockDeployment: true,
+    allowUserAiKey: true
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+`;
+
 function startServer() {
   const server = http.createServer((req, res) => {
     let p = decodeURIComponent(req.url.split('?')[0]);
     if (p === '/') p = '/index.html';
+
+    if (p === '/config.js') {
+      res.writeHead(200, { 'Content-Type': MIME['.js'] });
+      res.end(TEST_CONFIG_JS);
+      return;
+    }
+
     const file = path.join(ROOT, p);
     if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
       res.writeHead(404); res.end('not found'); return;
@@ -92,7 +128,7 @@ class CDP {
       this.ws.send(JSON.stringify({ id, method, params: params || {} }));
       setTimeout(() => {
         if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('CDP 超时: ' + method)); }
-      }, 30000);
+      }, 90000);
     });
   }
   async eval(expression) {
@@ -128,6 +164,8 @@ async function main() {
   const server = await startServer();
   console.log('静态服务启动：http://127.0.0.1:' + PORT);
 
+  // 每次运行使用全新的浏览器 profile，确保 localStorage 干净
+  // （否则上一次运行的残留会让「项目数」「导出条数」等断言失真）
   if (fs.existsSync(USER_DATA)) fs.rmSync(USER_DATA, { recursive: true, force: true });
 
   const chrome = spawn(CHROME, [
@@ -180,6 +218,19 @@ async function main() {
     /* ---------- 打开页面 ---------- */
     await cdp.send('Page.navigate', { url: 'http://127.0.0.1:' + PORT + '/index.html' });
     await sleep(2500);
+
+    // 显式清空本机数据后再重新加载，保证断言不受历史运行残留影响。
+    // 注意：必须在导航到真实页面之后操作 localStorage——在 about:blank 上访问会抛
+    // SecurityError。本套测试的 config.js 已由测试服务器替换为隔离配置（见文件顶部），
+    // 因此不会与真实 Supabase / DeepSeek 发生任何交互。
+    await cdp.eval(`
+      Object.keys(localStorage)
+        .filter(k => k.indexOf('qceval:') === 0)
+        .forEach(k => localStorage.removeItem(k));
+      return 1;
+    `);
+    await cdp.send('Page.reload');
+    await sleep(2200);
 
     console.log('\n=== 1. 页面加载与脚本可用性 ===');
     const loaded = await cdp.eval(`
@@ -301,8 +352,16 @@ async function main() {
 
     /* ---------- 保存记录 ---------- */
     console.log('\n=== 6. 保存记录与历史 ===');
+    // 保存前再确认一次为仅本地模式，避免任何意外的云端往返导致超时
+    const modeBefore = await cdp.eval(`
+      return {
+        mode: window.QCStore.getSettings().cloudMode,
+        configured: window.QCCloud.isConfigured(window.QCStore.getSettings()),
+      };
+    `);
+    ok(modeBefore.mode === 'local', '保存前确认为仅本地模式', modeBefore.mode);
     await cdp.eval(`document.getElementById('btnSave').click(); return 1;`);
-    await sleep(600);
+    await sleep(800);
     const saved = await cdp.eval(`
       const p = window.QCStore.getProject(window.QCStore.getCurrentProjectId());
       return { n: p.records.length, label: p.records[0] && p.records[0].periodLabel,
@@ -477,6 +536,87 @@ async function main() {
     const shot3 = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
     ok(shot3.data.length > 1000, '方法说明页截图已生成');
     ok(await saveShot(shot3, path.join(SHOT_DIR, '03-method.png')), '方法说明页截图已落盘');
+
+    /* ---------- 部署配置：打开即用 ---------- */
+    console.log('\n=== 14. 部署配置（config.js）打开即用 ===');
+    const deploy = await cdp.eval(`
+      const s = window.QCStore.getSettings();
+      document.getElementById('btnSettings').click();
+      const disp = (id) => {
+        const n = document.getElementById(id);
+        return { value: n.value, disabled: n.disabled };
+      };
+      return {
+        hasConfig: typeof window.QC_CONFIG === 'object',
+        settings: {
+          cloudUrl: s.cloudUrl, cloudCode: s.cloudCode, cloudMode: s.cloudMode,
+          model: s.model, apiBase: s.apiBase, apiKey: s.apiKey,
+        },
+        ui: {
+          cloudUrl: disp('setCloudUrl'),
+          cloudCode: disp('setCloudCode'),
+          cloudKey: disp('setCloudKey'),
+          cloudMode: disp('setCloudMode'),
+          model: disp('setModel'),
+          apiKey: disp('setApiKey'),
+        },
+        lockedTags: document.querySelectorAll('#settingsMask .lock-tag').length,
+      };
+    `);
+    ok(deploy.hasConfig === true, 'config.js 已加载');
+    ok(deploy.settings.cloudUrl === 'https://test-project.supabase.co',
+      '云端 URL 由部署配置自动提供（无需成员输入）', deploy.settings.cloudUrl);
+    ok(deploy.settings.cloudCode === 'test-deploy-code', '访问码由部署配置自动提供', deploy.settings.cloudCode);
+    ok(deploy.settings.cloudMode === 'local', '同步方式来自部署配置（本套测试隔离为仅本地）');
+    ok(deploy.settings.model === 'deepseek-flash', '模型由部署配置提供');
+    ok(deploy.ui.cloudUrl.value === deploy.settings.cloudUrl, '设置面板里 URL 已自动填好');
+    ok(deploy.ui.cloudCode.value === 'test-deploy-code', '设置面板里访问码已自动填好');
+    ok(deploy.ui.cloudKey.value === 'test-anon-key-for-locking-check-only', '设置面板里 anon key 已自动填好');
+    ok(deploy.ui.cloudUrl.disabled === true, 'URL 字段被锁定（防止成员误改）');
+    ok(deploy.ui.cloudCode.disabled === true, '访问码字段被锁定');
+    ok(deploy.ui.apiKey.disabled === false, 'AI Key 字段仍可编辑（按设计不写死）');
+    ok(deploy.lockedTags >= 4, '界面标注了「由部署方统一配置」', String(deploy.lockedTags));
+
+    /* ---------- 配置串导出/导入 ---------- */
+    console.log('\n=== 15. 配置串导出与导入 ===');
+    const cfgRound = await cdp.eval(`
+      document.getElementById('btnExportConfig').click();
+      const text = document.getElementById('importConfigText').value;
+      const boxShown = !document.getElementById('importConfigBox').hidden;
+      // 模拟另一台设备：清空本机设置后导入
+      localStorage.removeItem('qceval:settings');
+      const before = window.QCStore.getSettings().cloudUrl;
+      const res = window.QCStore.importConfigString(text);
+      const after = window.QCStore.getSettings();
+      return {
+        prefix: text.slice(0, 8), len: text.length, boxShown,
+        beforeUrl: before, applied: res.applied.length,
+        afterUrl: after.cloudUrl, afterCode: after.cloudCode, afterMode: after.cloudMode,
+      };
+    `);
+    ok(cfgRound.prefix === 'QCEVAL1:', '导出的是可分享的配置串', cfgRound.prefix);
+    ok(cfgRound.boxShown === true, '导出后自动显示配置串便于复制');
+    ok(cfgRound.applied >= 8, '导入应用了多项配置', String(cfgRound.applied));
+    ok(cfgRound.afterUrl === 'https://test-project.supabase.co', '导入后云端 URL 正确', cfgRound.afterUrl);
+    ok(cfgRound.afterCode === 'test-deploy-code', '导入后访问码正确');
+    ok(cfgRound.afterMode === 'local', '导入后同步方式正确');
+
+    const cfgBad = await cdp.eval(`
+      const out = [];
+      try { window.QCStore.importConfigString('随便乱写的内容'); out.push('no-error'); }
+      catch (e) { out.push(e.message); }
+      try { window.QCStore.importConfigString('QCEVAL1:bm90LWpzb24='); out.push('no-error'); }
+      catch (e) { out.push(e.message); }
+      try { window.QCStore.importConfigString(JSON.stringify({ app: 'qc-eval', projects: {} })); out.push('no-error'); }
+      catch (e) { out.push(e.message); }
+      return out;
+    `);
+    ok(/无法识别/.test(cfgBad[0]), '乱写内容被拒绝并给出可读提示', cfgBad[0]);
+    ok(/JSON|格式/.test(cfgBad[1]), '非法 base64 内容被拒绝', cfgBad[1]);
+    ok(/不是本工具的配置串/.test(cfgBad[2]), '数据备份文件被正确区分（防止误导入）', cfgBad[2]);
+
+    await cdp.eval(`document.getElementById('btnCloseSettings').click(); return 1;`);
+    await sleep(300);
 
     /* ---------- 收尾错误检查 ---------- */
     console.log('\n=== 13. 全程错误检查 ===');

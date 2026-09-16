@@ -1320,7 +1320,41 @@
     $('setCloudMode').value = s.cloudMode || 'dual';
     $('keyTestResult').textContent = '';
     $('cloudTestResult').textContent = '';
+    $('importConfigResult').textContent = '';
+    applyDeploymentLock();
     $('settingsMask').hidden = false;
+  }
+
+  /** 部署方锁定的字段：禁用并标注来源，防止成员误改导致全员不可用 */
+  function applyDeploymentLock() {
+    const lock = (id, key, label) => {
+      const n = $(id);
+      if (!n) return;
+      const locked = S.isLocked(key);
+      n.disabled = locked;
+      const span = n.parentElement ? n.parentElement.querySelector('span') : null;
+      if (span && locked) {
+        if (!span.querySelector('.lock-tag')) {
+          const tag = el('em', 'lock-tag', '（由部署方统一配置，不可修改）');
+          span.appendChild(tag);
+        }
+      } else if (span) {
+        const t = span.querySelector('.lock-tag');
+        if (t) t.remove();
+      }
+    };
+    lock('setCloudUrl', 'cloudUrl');
+    lock('setCloudKey', 'cloudKey');
+    lock('setCloudCode', 'cloudCode');
+    lock('setCloudMode', 'cloudMode');
+    lock('setModel', 'model');
+    lock('setApiBase', 'apiBase');
+    lock('setApiKey', 'apiKey');
+    // AI Key 锁定（即已由服务端代理提供）时，隐藏整块提示
+    const cfg = S.deploymentConfig();
+    const keyLocked = !cfg.allowUserAiKey;
+    const keyHint = $('btnTestKey');
+    if (keyHint) keyHint.disabled = false; // 测试按钮始终可用（便于排查）
   }
   function closeSettings() { $('settingsMask').hidden = true; }
 
@@ -1373,6 +1407,18 @@
   }
 
   function safeName(n) { return String(n).replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40); }
+
+  function copyToClipboard(text) {
+    // 注意：clipboard.writeText 返回 Promise，同步 try/catch 接不住它的拒绝
+    // （页面未获得焦点时会抛 NotAllowedError），必须显式 catch，否则成为未捕获异常。
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => { /* 未获焦点或无权限，退回手动复制 */ });
+        return true;
+      }
+    } catch (e) { /* 同步异常，同样退回手动复制 */ }
+    return false;
+  }
 
   function download(text, filename) {
     const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
@@ -1534,6 +1580,52 @@
       $('cloudTestResult').textContent = '已断开。若要再次启用，请把同步方式改回「双写」并重新连接。';
       updateCloudStatus();
       toast('已断开云端，当前为纯本地模式', 'ok');
+    });
+
+    /* ---------- 配置分发 ---------- */
+    $('btnExportConfig').addEventListener('click', () => {
+      const text = S.exportConfigString(true);
+      const okCopy = copyToClipboard(text);
+      const box = $('importConfigBox');
+      const btnRow = $('importConfigBtns');
+      box.hidden = false;
+      btnRow.hidden = false;
+      $('importConfigText').value = text;
+      $('importConfigResult').textContent = okCopy
+        ? '✓ 配置串已复制到剪贴板（含 API Key，请只发内部渠道）'
+        : '已生成，请手动全选下方文本复制（含 API Key，请只发内部渠道）';
+      $('importConfigText').select();
+    });
+
+    $('btnImportConfig').addEventListener('click', () => {
+      const box = $('importConfigBox');
+      const btnRow = $('importConfigBtns');
+      const showing = !box.hidden;
+      box.hidden = showing;
+      btnRow.hidden = showing;
+      if (!showing) {
+        $('importConfigText').value = '';
+        $('importConfigResult').textContent = '';
+        $('importConfigText').focus();
+      }
+    });
+
+    $('btnApplyConfig').addEventListener('click', async () => {
+      const out = $('importConfigResult');
+      out.textContent = '应用中…';
+      try {
+        const res = S.importConfigString($('importConfigText').value);
+        out.textContent = '✓ 已应用 ' + res.applied.length + ' 项配置';
+        toast('配置已导入，正在刷新设置', 'ok');
+        openSettings();
+        out.textContent = '✓ 已应用 ' + res.applied.length + ' 项配置，可点「测试并连接」验证';
+        const st = S.getSettings();
+        if ((st.cloudMode || 'dual') !== 'local' && CL.isConfigured(st)) {
+          await cloudPull({ quiet: true });
+        }
+      } catch (e) {
+        out.textContent = '✗ ' + e.message;
+      }
     });
 
     $('btnData').addEventListener('click', openData);

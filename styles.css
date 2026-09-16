@@ -108,6 +108,11 @@ ul.plain li, ol.plain li { margin-bottom: 4px; }
 .field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 0; min-width: 0; }
 .field > span { font-size: 12px; color: var(--text-2); display: flex; align-items: baseline; gap: 6px; }
 .field > span em { font-style: normal; font-size: 11px; color: var(--text-3); }
+.field > span .lock-tag { font-style: normal; font-size: 11px; color: var(--warn); font-weight: 600; }
+input:disabled, select:disabled, textarea:disabled {
+  background: #f1f3f5; color: var(--text-2); cursor: not-allowed;
+}
+textarea { font-family: inherit; }
 .field.inline { flex-direction: row; align-items: center; gap: 8px; }
 .field.inline > span { font-size: 12px; white-space: nowrap; }
 input[type="text"], input[type="number"], input[type="password"], select {

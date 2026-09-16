@@ -312,9 +312,9 @@ $$;
 --   安全：需同时提供正确访问码与确认串；单项目一次最多删 200 条，避免误操作清库。
 -- ---------------------------------------------------------------------------
 create or replace function public.qc_admin_cleanup(
-  p_code       text,
-  p_confirm    text,
-  p_project_id uuid default null
+  p_code        text,
+  p_confirm     text,
+  p_project_ids uuid[] default null
 ) returns jsonb
 language plpgsql
 security definer
@@ -331,20 +331,20 @@ begin
     raise exception 'CONFIRM_REQUIRED: 需传入确认串 CONFIRM_DELETE';
   end if;
 
-  if p_project_id is null then
-    -- 清理所有测试用项目（名称以 __E2E 开头）
+  if p_project_ids is null or array_length(p_project_ids, 1) is null then
+    -- 未指定项目：清理所有测试用项目（名称以 __E2E 开头）
     select count(*) into v_records
       from qc_records r join qc_projects p on p.id = r.project_id
      where p.name like '\_\_E2E%' escape '\';
     delete from qc_projects where name like '\_\_E2E%' escape '\';
     get diagnostics v_projects = row_count;
   else
-    select count(*) into v_records from qc_records where project_id = p_project_id;
+    select count(*) into v_records from qc_records where project_id = any(p_project_ids);
     if v_records > 200 then
       raise exception 'TOO_MANY: 单次最多清理 200 条记录，当前 % 条', v_records;
     end if;
-    delete from qc_records where project_id = p_project_id;
-    delete from qc_projects where id = p_project_id;
+    delete from qc_records where project_id = any(p_project_ids);
+    delete from qc_projects where id = any(p_project_ids);
     get diagnostics v_projects = row_count;
   end if;
 
@@ -361,7 +361,7 @@ grant execute on function public.qc_upsert_record(text, text, text, text, jsonb)
 grant execute on function public.qc_delete_record(text, uuid)                    to anon, authenticated;
 grant execute on function public.qc_delete_project(text, uuid)                   to anon, authenticated;
 grant execute on function public.qc_rename_project(text, uuid, text)             to anon, authenticated;
-grant execute on function public.qc_admin_cleanup(text, text, uuid)              to anon, authenticated;
+grant execute on function public.qc_admin_cleanup(text, text, uuid[])              to anon, authenticated;
 
 -- ---------------------------------------------------------------------------
 -- 6. 只读视图（便于用 SQL 直接查或做报表；视图不对外授权，仅控制台可用）

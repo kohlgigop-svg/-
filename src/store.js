@@ -88,10 +88,57 @@
     cloudMode: 'dual',     // dual 双写 / cloud 仅云端 / local 仅本地
   };
 
+  /* ---------------------------------------------------------------------------
+   * 部署默认配置（config.js 提供）
+   *   由部署方一次配置，全员打开即用；本地已保存的值优先于默认值。
+   * ------------------------------------------------------------------------ */
+
+  function deploymentConfig() {
+    const c = (typeof global !== 'undefined' && global.QC_CONFIG) ? global.QC_CONFIG : {};
+    return c && typeof c === 'object' ? c : {};
+  }
+
+  /** 把部署配置映射成 settings 字段（只取认识的键） */
+  function configToSettings(cfg) {
+    const map = {
+      cloudUrl: 'cloudUrl', cloudKey: 'cloudKey', cloudCode: 'cloudCode', cloudMode: 'cloudMode',
+      aiKey: 'apiKey', aiModel: 'model', aiBase: 'apiBase', aiMaxTokens: 'maxTokens',
+      acceptAccuracy: 'acceptAccuracy', obsWindow: 'obsWindow', alpha: 'alpha', bootstrapB: 'bootstrapB',
+    };
+    const out = {};
+    Object.keys(map).forEach((k) => {
+      const v = cfg[k];
+      if (v === undefined || v === null || v === '') return;
+      out[map[k]] = v;
+    });
+    return out;
+  }
+
+  /** 该字段是否由部署方锁定（成员不可改） */
+  function isLocked(key) {
+    const cfg = deploymentConfig();
+    if (!cfg.lockDeployment) return false;
+    const locked = {
+      cloudUrl: cfg.cloudUrl, cloudKey: cfg.cloudKey, cloudCode: cfg.cloudCode,
+      cloudMode: cfg.cloudMode, apiBase: cfg.aiBase, model: cfg.aiModel,
+    };
+    if (key === 'apiKey') return !cfg.allowUserAiKey;
+    return !!locked[key];
+  }
+
   function getSettings() {
-    const s = readJSON(K_SETTINGS, {});
-    const out = Object.assign({}, DEFAULT_SETTINGS, s);
-    // 旧版内置 key 迁移：若曾把 key 写进代码，允许旧值延续，但不写入默认值
+    const cfg = deploymentConfig();
+    const saved = readJSON(K_SETTINGS, {});
+    // 优先级：本地已保存 > 部署配置 > 内置默认
+    const out = Object.assign({}, DEFAULT_SETTINGS, configToSettings(cfg), saved);
+    // 部署方锁定项一律以部署配置为准，防止成员误改导致全员不可用
+    if (cfg.lockDeployment) {
+      const forced = configToSettings(cfg);
+      Object.keys(forced).forEach((k) => {
+        if (k === 'apiKey' && cfg.allowUserAiKey) return; // Key 由成员自己填
+        out[k] = forced[k];
+      });
+    }
     return out;
   }
 
@@ -453,6 +500,77 @@
   }
 
   /* ---------------------------------------------------------------------------
+   * 配置串的导出与导入（用于管理员一次配置、分发给成员）
+   * ------------------------------------------------------------------------ */
+
+  /** 需要随配置串分发的字段 */
+  const CONFIG_KEYS = [
+    'apiKey', 'model', 'apiBase', 'maxTokens',
+    'cloudUrl', 'cloudKey', 'cloudCode', 'cloudMode',
+    'acceptAccuracy', 'obsWindow', 'alpha', 'bootstrapB',
+  ];
+
+  /**
+   * 导出配置串：base64(JSON)，一段文本即可发给成员粘贴。
+   * @param {boolean} includeAiKey 是否包含 AI Key（默认包含——这正是本功能的目的）
+   */
+  function exportConfigString(includeAiKey) {
+    const s = getSettings();
+    const payload = { app: 'qc-eval-config', v: 1, at: new Date().toISOString(), data: {} };
+    CONFIG_KEYS.forEach((k) => {
+      if (k === 'apiKey' && includeAiKey === false) return;
+      if (s[k] !== undefined && s[k] !== null && s[k] !== '') payload.data[k] = s[k];
+    });
+    let json = JSON.stringify(payload);
+    // 浏览器与非浏览器环境都能用
+    if (typeof btoa === 'function') {
+      return 'QCEVAL1:' + btoa(unescape(encodeURIComponent(json)));
+    }
+    return 'QCEVAL1_JSON:' + json;
+  }
+
+  /**
+   * 导入配置串，写入本机设置
+   * @returns {{applied:string[], skipped:string[]}}
+   */
+  function importConfigString(str) {
+    const text = String(str || '').trim();
+    if (!text) throw new Error('配置串为空。');
+    let json = null;
+    if (text.indexOf('QCEVAL1:') === 0) {
+      const b64 = text.slice('QCEVAL1:'.length).trim();
+      try {
+        json = decodeURIComponent(escape(atob(b64)));
+      } catch (e) {
+        throw new Error('配置串格式不正确（base64 解析失败）。请确认复制完整。');
+      }
+    } else if (text.indexOf('QCEVAL1_JSON:') === 0) {
+      json = text.slice('QCEVAL1_JSON:'.length);
+    } else if (text.charAt(0) === '{') {
+      json = text; // 直接粘 JSON 也支持
+    } else {
+      throw new Error('无法识别的配置串格式。应以 QCEVAL1: 开头，或直接粘贴 JSON。');
+    }
+
+    let payload = null;
+    try { payload = JSON.parse(json); } catch (e) { throw new Error('配置串内容不是合法 JSON。'); }
+    if (!payload || payload.app !== 'qc-eval-config') {
+      throw new Error('这不是本工具的配置串（缺少 app 标识）。注意：数据备份文件不能用于此处。');
+    }
+    const data = payload.data || {};
+    const applied = [];
+    const skipped = [];
+    const patch = {};
+    CONFIG_KEYS.forEach((k) => {
+      if (data[k] === undefined || data[k] === null || data[k] === '') { skipped.push(k); return; }
+      patch[k] = data[k];
+      applied.push(k);
+    });
+    saveSettings(patch);
+    return { applied: applied, skipped: skipped };
+  }
+
+  /* ---------------------------------------------------------------------------
    * 导出
    * ------------------------------------------------------------------------ */
 
@@ -460,7 +578,13 @@
     K_PROJECTS: K_PROJECTS,
     getSettings: getSettings,
     saveSettings: saveSettings,
+    deploymentConfig: deploymentConfig,
+    isLocked: isLocked,
     DEFAULT_SETTINGS: DEFAULT_SETTINGS,
+    /** 导出可分享的配置串（不含本机业务数据） */
+    exportConfigString: exportConfigString,
+    /** 从配置串导入 */
+    importConfigString: importConfigString,
     listProjects: listProjects,
     getProject: getProject,
     createProject: createProject,

@@ -3,6 +3,8 @@ node_modules/
 package-lock.json
 
 # 测试临时产物
+test/.chrome-diag/
+test/.chrome-*/
 test/.chrome-profile/
 test/.chrome-render/
 test/.chrome-probe/

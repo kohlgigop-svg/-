@@ -368,6 +368,24 @@
         <span class="hint tiny" id="cloudTestResult"></span>
       </div>
 
+      <div class="subhead"><h3>配置分发（管理员用）</h3></div>
+      <p class="hint">
+        管理员在本机配置好后导出配置串，发到内部群；成员在「设置」里粘贴一次即可，
+        之后不需要再填任何参数。<strong>配置串含 API Key，请只发内部渠道，不要贴到公开网页。</strong>
+      </p>
+      <div class="row-inline gap">
+        <button class="btn btn-mini" id="btnExportConfig" type="button">导出配置串</button>
+        <button class="btn btn-mini" id="btnImportConfig" type="button">导入配置串</button>
+      </div>
+      <label class="field" id="importConfigBox" hidden>
+        <span>粘贴配置串<em>以 QCEVAL1: 开头</em></span>
+        <textarea id="importConfigText" rows="3" placeholder="QCEVAL1:eyJhcHAiOiJxYy1ldmFsLWNvbmZpZyIs..." style="width:100%;font-family:ui-monospace,monospace;font-size:11.5px;padding:6px 9px;border:1px solid var(--border-strong);border-radius:6px"></textarea>
+      </label>
+      <div class="row-inline gap" id="importConfigBtns" hidden>
+        <button class="btn btn-mini btn-primary" id="btnApplyConfig" type="button">应用配置</button>
+        <span class="hint tiny" id="importConfigResult"></span>
+      </div>
+
       <p class="hint">
         说明：工具为纯前端页面，API Key 与云端凭据都存于本机 localStorage，不会上传到任何第三方服务器。
         请勿在公用电脑上保存。数据库侧已开启行级权限，直接访问数据表会被拒绝，读写均走带访问码校验的函数。
@@ -406,6 +424,7 @@
 
 <div class="toast-zone" id="toastZone"></div>
 
+<script src="config.js"></script>
 <script src="src/core.js"></script>
 <script src="src/store.js"></script>
 <script src="src/cloud.js"></script>
