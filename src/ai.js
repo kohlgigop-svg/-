@@ -103,6 +103,8 @@
     L.push('===== 二、混淆矩阵（正例 = 驳回，负例 = 通过）=====');
     L.push('TP 正确驳回 = ' + m.counts.TP);
     L.push('FP 误驳回 = ' + m.counts.FP);
+    // 注意：这里的标签刻意比录入表单多一个「（漏判）」注释，
+    // 目的是让模型更准确理解业务含义；不要与表单文案强行统一。
     L.push('FN 错误通过（漏判）= ' + m.counts.FN);
     L.push('TN 正确通过 = ' + m.counts.TN);
     L.push('合计 N = ' + m.counts.N);
