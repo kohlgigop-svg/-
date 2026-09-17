@@ -59,10 +59,14 @@
     return {
       ensureProject: (name, cloudId) => S.ensureProject(name, cloudId, null),
       mergeRecords: (projectId, records) => S.mergeRecords(projectId, records),
+      // 关键：以云端为准的全量对齐（含删除），见 store.js 中的说明
+      mergeRecordsAuthoritative: (projectId, records) => S.mergeRecordsAuthoritative(projectId, records),
+      pruneProjectsNotIn: (names) => S.pruneProjectsNotIn(names),
+      currentProjectId: () => S.getCurrentProjectId(),
     };
   }
 
-  /** 从云端拉取并合并到本地，然后刷新界面 */
+  /** 从云端拉取并与本地全量对齐，然后刷新界面 */
   async function cloudPull(opts) {
     const settings = cloudSettings();
     if (!CL.isConfigured(settings)) return null;
@@ -75,8 +79,12 @@
       renderHistory();
       updateCloudStatus();
       if (!quiet) {
-        toast('云端同步完成：' + stats.projects + ' 个项目、' + stats.records + ' 条记录'
-          + (stats.added ? '（新增 ' + stats.added + '）' : ''), 'ok');
+        const parts = [];
+        if (stats.added) parts.push('新增 ' + stats.added);
+        if (stats.updated) parts.push('更新 ' + stats.updated);
+        if (stats.removed) parts.push('移除 ' + stats.removed + '（他人已删除）');
+        toast('云端已对齐：' + stats.projects + ' 个项目、' + stats.records + ' 条记录'
+          + (parts.length ? '（' + parts.join('，') + '）' : ''), 'ok');
       }
       return stats;
     } catch (e) {
@@ -1008,23 +1016,78 @@
   /* ==========================================================================
    * 保存 / 载入
    * ======================================================================== */
-  function saveRecord() {
+  async function saveRecord() {
     const r = state.result;
     if (!r) return;
     const project = S.getProject(S.getCurrentProjectId());
     if (!project) { toast('请先选择或新建项目。', 'err'); return; }
 
     let period = r.input.periodLabel;
-    const samePeriod = project.records.some((x) => x.periodLabel && x.periodLabel === period);
-    if (samePeriod && period) {
-      const ok = window.confirm('周期「' + period + '」已存在记录。是否覆盖该周期的记录？');
-      if (!ok) return;
-    }
     if (!period) {
       period = new Date().toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
       r.input.periodLabel = period;
       $('periodLabel').value = period;
     }
+
+    const settings = cloudSettings();
+    const mode = settings.cloudMode || 'dual';
+    const useCloud = mode !== 'local' && CL.isConfigured(settings);
+
+    // 云端模式下先写云端：只有云端成功，才写入本地。
+    // 这样本地缓存永远不会出现「云端没有」的记录——
+    // 那类记录会在下次保存时被推回云端，把别人删掉的数据复活。
+    if (useCloud) {
+      const existing = project.records.find((x) => x.periodLabel === period);
+      const mine = !existing || !existing.cloudSubmitter
+        || existing.cloudSubmitter === CL.currentUserId();
+      if (existing && !mine) {
+        toast('周期「' + period + '」的记录由其他成员提交，你只能修订自己提交的记录。'
+          + '请换一个周期名，或让对方自行修改。', 'err');
+        return;
+      }
+      if (existing && !window.confirm('周期「' + period + '」已存在记录，将修订为本次结果。继续？')) return;
+
+      $('btnSave').disabled = true;
+      toast('正在写入云端…');
+      let cloudRes = null;
+      try {
+        cloudRes = await cloudPushRecord(project, buildRecordPayload(r, period));
+      } catch (e) {
+        toast('云端写入失败，本次未保存：' + e.message, 'err');
+        $('btnSave').disabled = false;
+        return;
+      }
+      if (!cloudRes) { $('btnSave').disabled = false; toast('云端未响应，本次未保存。', 'err'); return; }
+
+      // 云端成功后再落本地
+      const rec = buildRecordPayload(r, period);
+      S.addRecord(project.id, rec, true);
+      if (cloudRes.id) S.setCloudMeta(project.id, period, cloudRes.id, CL.currentUserId());
+      toast('已保存到云端' + (cloudRes.revision > 1 ? '（第 ' + cloudRes.revision + ' 版）' : '')
+        + '：周期「' + period + '」', 'ok');
+      $('btnSave').disabled = false;
+      renderProjectSelect();
+      renderHistory();
+      return;
+    }
+
+    // 纯本地模式（未配置云端）：保持原有行为
+    const samePeriod = project.records.some((x) => x.periodLabel && x.periodLabel === period);
+    if (samePeriod) {
+      if (!window.confirm('周期「' + period + '」已存在记录。是否覆盖该周期的记录？')) return;
+    }
+    try {
+      S.addRecord(project.id, buildRecordPayload(r, period), true);
+      toast('已保存记录：周期「' + period + '」（本机）', 'ok');
+      renderProjectSelect();
+      renderHistory();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  }
+
+  /** 由当前计算结果组装一条完整记录 */
+  function buildRecordPayload(r, period) {
 
     const rec = {
       periodLabel: period,
@@ -1070,31 +1133,7 @@
       aiSummary: state.aiResult && state.aiResult.parsed ? state.aiResult.parsed.summary : null,
       computedAt: r.computedAt,
     };
-
-    try {
-      S.addRecord(project.id, rec, true);
-      renderProjectSelect();
-    } catch (e) {
-      toast(e.message, 'err');
-      return;
-    }
-
-    // 云端写入（失败不回滚本地，只提示，避免网络问题导致数据丢失）
-    const mode = cloudSettings().cloudMode || 'dual';
-    if (mode !== 'local' && CL.isConfigured(cloudSettings())) {
-      toast('已保存到本机，正在同步云端…');
-      cloudPushRecord(project, rec).then((res) => {
-        if (res) {
-          toast('已同步到云端：周期「' + period + '」' + (res.revision > 1 ? '（第 ' + res.revision + ' 版）' : ''), 'ok');
-          // 回填云端标识，便于后续判定改删权限
-          if (res.id) S.setCloudMeta(project.id, period, res.id, CL.currentUserId());
-        }
-      }).catch((e) => {
-        toast('云端同步失败（本机已保存）：' + e.message, 'err');
-      });
-    } else {
-      toast('已保存记录：周期「' + period + '」（本机）', 'ok');
-    }
+    return rec;
   }
 
   function loadRecord(rec) {
@@ -1180,25 +1219,35 @@
       bDel.type = 'button';
       bDel.addEventListener('click', async () => {
         if (!window.confirm('删除项目「' + p.name + '」及其 ' + p.recordCount + ' 次记录？此操作不可恢复。')) return;
-        // 先取出云端标识，再删除本地项目
         const beforeDel = S.getProject(p.id);
         const cloudId = (beforeDel && beforeDel.cloudId) || null;
+        const settings = S.getSettings();
+        const onCloud = (settings.cloudMode || 'dual') !== 'local' && CL.isConfigured(settings);
+
+        // 云端模式：先删云端，成功后才删本地。
+        // 顺序反了会出问题——本地删掉、云端还在，下次拉取又会「长回来」。
+        if (onCloud && cloudId) {
+          const hasOthers = (beforeDel.records || []).some(
+            (r) => r.cloudSubmitter && r.cloudSubmitter !== CL.currentUserId());
+          if (hasOthers) {
+            toast('该项目下存在其他成员提交的记录，无法整体删除。'
+              + '请先由各成员删除自己的记录，或使用管理员清理函数。', 'err');
+            return;
+          }
+          try {
+            await CL.deleteProject(settings, cloudId);
+          } catch (e) {
+            toast('云端删除失败，本项目未删除：' + e.message, 'err');
+            updateCloudStatus(e.message);
+            return;
+          }
+        }
+
         S.deleteProject(p.id);
         renderProjectAdmin();
         renderProjectSelect();
         renderHistory();
-        toast('已从本机删除项目', 'ok');
-        // 云端：仅当该项目下没有他人记录时才允许删除
-        const settings = S.getSettings();
-        if ((settings.cloudMode || 'dual') !== 'local' && CL.isConfigured(settings) && cloudId) {
-          try {
-            await CL.deleteProject(settings, cloudId);
-            toast('已从云端删除项目', 'ok');
-          } catch (e) {
-            toast('云端删除失败：' + e.message, 'err');
-            updateCloudStatus(e.message);
-          }
-        }
+        toast(onCloud && cloudId ? '已从云端与本机删除项目' : '已从本机删除项目', 'ok');
       });
       right.appendChild(bRename);
       right.appendChild(bDel);

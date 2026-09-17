@@ -295,12 +295,19 @@
 
   /**
    * @param {object} settings
-   * @param {object} hooks { ensureProject(name, cloudId, config), mergeRecords(projectId, records) }
-   * @returns {{projects:number, records:number, added:number, updated:number}}
+   * @param {object} hooks {
+   *   ensureProject(name, cloudId, config),
+   *   mergeRecordsAuthoritative(projectId, records),   // 以云端为准（含删除）
+   *   pruneProjectsNotIn(names, keepCurrentId),
+   *   currentProjectId()
+   * }
+   * @returns {{projects:number, records:number, added:number, updated:number, removed:number, prunedProjects:string[]}}
    */
   async function syncToLocal(settings, hooks) {
     const remote = await fetchAll(settings);
-    const stats = { projects: 0, records: 0, added: 0, updated: 0 };
+    const stats = { projects: 0, records: 0, added: 0, updated: 0, removed: 0, prunedProjects: [] };
+    const remoteNames = remote.map((rp) => rp.project_name);
+
     for (const rp of remote) {
       const local = hooks.ensureProject(rp.project_name, rp.project_id, null);
       if (!local) continue;
@@ -325,11 +332,23 @@
         cloudSubmitter: r.submitter,
         cloudRevision: r.revision,
       }));
-      const one = hooks.mergeRecords(local.id, recs);
+
+      // 以云端为准地全量对齐：本地多出来的记录（他人已删）会被移除。
+      // 这一步是防止「已删除记录被复活」的关键。
+      const one = hooks.mergeRecordsAuthoritative
+        ? hooks.mergeRecordsAuthoritative(local.id, recs)
+        : hooks.mergeRecords(local.id, recs);
       stats.records += recs.length;
       stats.added += one.added;
       stats.updated += one.updated;
+      stats.removed += one.removed || 0;
     }
+
+    // 云端已不存在的项目也要从本地清掉（否则会永远残留在项目下拉框里）
+    if (hooks.pruneProjectsNotIn) {
+      stats.prunedProjects = hooks.pruneProjectsNotIn(remoteNames);
+    }
+
     return stats;
   }
 

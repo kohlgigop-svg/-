@@ -353,6 +353,90 @@
     return { added: added, updated: updated };
   }
 
+  /**
+   * 权威对齐：让本地缓存「完全等于」云端内容。
+   *
+   * 与 mergeRecords 的区别（这是多用户场景的关键）：
+   *   mergeRecords   只增改，从不删除 → 别人删掉的记录会永远残留在本机，
+   *                  更严重的是下次保存会把残留记录重新写回云端（复活）。
+   *   mergeRecordsAuthoritative  以云端为准：云端有什么就留什么，
+   *                  本地有而云端没有的一律移除。
+   *
+   * 因此凡是以云端为数据源的场景（cloudMode 为 cloud/dual 时的拉取），
+   * 都必须用这个函数，而不是 mergeRecords。
+   *
+   * @returns {{added:number, updated:number, removed:number, total:number}}
+   */
+  function mergeRecordsAuthoritative(projectId, records) {
+    const all = loadAll();
+    if (!all[projectId]) return { added: 0, updated: 0, removed: 0, total: 0 };
+    const local = all[projectId].records || [];
+
+    // 云端本周期集合
+    const remotePeriods = {};
+    records.forEach((r) => { if (r.periodLabel) remotePeriods[r.periodLabel] = true; });
+
+    // 1. 移除本地有、云端没有的记录（别人删掉的）
+    const kept = local.filter((r) => r.periodLabel && remotePeriods[r.periodLabel]);
+    const removed = local.length - kept.length;
+
+    // 2. 以云端内容覆盖/新增，同时保留本地 id 以维持界面引用稳定
+    const byPeriod = {};
+    kept.forEach((r) => { byPeriod[r.periodLabel] = r; });
+
+    let added = 0, updated = 0;
+    const next = records.map((rec) => {
+      const exist = byPeriod[rec.periodLabel];
+      if (exist) {
+        updated++;
+        return Object.assign({}, exist, rec, {
+          id: exist.id,                                    // 保留本地 id
+          savedAt: exist.savedAt || rec.savedAt || Date.now(),
+        });
+      }
+      added++;
+      return Object.assign({}, rec, { id: uid('rec'), savedAt: rec.savedAt || Date.now() });
+    });
+
+    next.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+    all[projectId].records = next;
+    all[projectId].updatedAt = Date.now();
+    saveAll(all);
+    return { added: added, updated: updated, removed: removed, total: next.length };
+  }
+
+  /**
+   * 移除本地「不在云端」的项目（云端已删的项目不应残留）。
+   * 仅当调用方确认本次是完整拉取时才可调用。
+   *
+   * 注意：这里刻意不做「当前项目豁免」。曾经为了避免界面空转而保留当前项目，
+   * 结果导致「别人删掉的、恰好是你当前打开的项目」会永久残留在下拉框里。
+   * 当前项目被移除后，getCurrentProjectId() 会自动回退到第一个可用项目，
+   * 因此不需要豁免。
+   *
+   * @param {string[]} remoteNames 云端存在的项目名（本次完整拉取的结果）
+   * @returns {string[]} 被移除的项目名
+   */
+  function pruneProjectsNotIn(remoteNames) {
+    const all = loadAll();
+    const keep = {};
+    (remoteNames || []).forEach((n) => { keep[n] = true; });
+    const removed = [];
+    Object.keys(all).forEach((id) => {
+      if (!keep[all[id].name]) {
+        removed.push(all[id].name);
+        delete all[id];
+      }
+    });
+    if (removed.length) {
+      saveAll(all);
+      // 清理已失效的「当前项目」记录
+      const cur = rawGet(K_CURRENT);
+      if (cur && !all[cur]) rawSet(K_CURRENT, '');
+    }
+    return removed;
+  }
+
   /** 给指定周期的记录回填云端标识（不改变其它字段） */
   function setCloudMeta(projectId, periodLabel, cloudId, submitter) {
     const all = loadAll();
@@ -606,6 +690,8 @@
     getHistory: getHistory,
     mergeRecord: mergeRecord,
     mergeRecords: mergeRecords,
+    mergeRecordsAuthoritative: mergeRecordsAuthoritative,
+    pruneProjectsNotIn: pruneProjectsNotIn,
     setCloudMeta: setCloudMeta,
     ensureProject: ensureProject,
     removeProject: removeProject,

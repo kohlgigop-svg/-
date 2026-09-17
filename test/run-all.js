@@ -1,4 +1,4 @@
-/* 一次跑完全部测试，汇总结果 */
+﻿/* 一次跑完全部测试，汇总结果 */
 'use strict';
 const { spawnSync } = require('child_process');
 const path = require('path');
@@ -10,6 +10,7 @@ const suites = [
   ['浏览器端到端', 'browser.e2e.js'],
   ['渲染验证', 'render.test.js'],
   ['云端端到端（需 Supabase）', 'cloud.test.js'],
+  ['多用户同步一致性（需 Supabase）', 'sync-multi-user.test.js'],
   ['线上部署验收', 'live.test.js'],
 ];
 
