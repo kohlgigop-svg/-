@@ -240,7 +240,19 @@
     if (input.strata.length) {
       const sumSample = input.strata.reduce((a, s) => a + s.sample, 0);
       if (sumSample !== N) {
-        warns.push('分层抽样数合计 ' + sumSample + ' 条，与混淆矩阵合计 ' + N + ' 条不一致；有效样本量仅供参考。');
+        warns.push('分层抽样数合计 ' + sumSample + ' 条，与混淆矩阵合计 ' + N + ' 条不一致；加权口径将停用。');
+      }
+      // 分层依据是「质检判定」，因此各层抽样数必须与混淆矩阵的对应格子相符，
+      // 否则权重会算错，加权结果比不加权更危险。
+      const pos = input.strata.find((s) => /驳回/.test(s.name));
+      const neg = input.strata.find((s) => /通过/.test(s.name));
+      if (pos && pos.sample !== cm.TP + cm.FP) {
+        warns.push('驳回层抽样数 ' + pos.sample + ' 条 ≠ TP+FP = ' + (cm.TP + cm.FP)
+          + ' 条。分层依据应为「质检判定」，驳回层即质检判为驳回的那部分；对不上则加权口径停用。');
+      }
+      if (neg && neg.sample !== cm.FN + cm.TN) {
+        warns.push('通过层抽样数 ' + neg.sample + ' 条 ≠ FN+TN = ' + (cm.FN + cm.TN)
+          + ' 条；对不上则加权口径停用。');
       }
       input.strata.forEach((s) => {
         if (s.sample > s.pop) errs.push('「' + s.name + '」的抽样数大于总体数，请核对。');
@@ -259,14 +271,38 @@
     const project = S.getProject(S.getCurrentProjectId());
 
     const cm = input.cm;
-    const metrics = C.computeMetrics(cm);
+
+    /* ---- 分层抽样：非等概率时必须改用加权口径 ----
+     * 非等概率分层（例如对「已驳回层」过采样）下，直接用抽样内计数算出的
+     * R / Spec / Acc / π / τ 都是有偏的，实测偏差可达数十个百分点，
+     * 且朴素置信区间在模拟中从未覆盖真值。详见 test/stratified.test.js。 */
+    const stratified = input.strata.length
+      ? C.computeStratified(input.strata, cm, {
+        alpha: settings.alpha || 0.05,
+        B: settings.bootstrapB || 4000,
+        seed: 20240617,
+      })
+      : null;
+    const useWeighted = C.shouldUseWeighted(stratified);
+
+    const baseMetrics = C.computeMetrics(cm);
+    const metrics = useWeighted ? C.mergeWeightedMetrics(baseMetrics, stratified) : baseMetrics;
     const effSS = input.strata.length ? C.effectiveSampleSize(input.strata) : null;
 
-    const bootstrap = C.bootstrapF(cm, {
-      B: settings.bootstrapB || 4000,
-      alpha: settings.alpha || 0.05,
-      seed: 20240617,
-    });
+    const bootstrap = useWeighted
+      ? {
+        n: stratified.popTotal,
+        B: settings.bootstrapB || 4000,
+        alpha: settings.alpha || 0.05,
+        seed: 20240617,
+        stratified: true,
+        result: stratified.bootF,
+      }
+      : C.bootstrapF(cm, {
+        B: settings.bootstrapB || 4000,
+        alpha: settings.alpha || 0.05,
+        seed: 20240617,
+      });
 
     const history = project ? S.getHistory(project.id) : [];
     const historyPi = history.map((r) => r.metrics && r.metrics.piActual).filter((v) => Number.isFinite(v));
@@ -340,6 +376,8 @@
       settings: settings,
       bootstrap: bootstrap,
       effSS: effSS,
+      stratified: stratified,
+      useWeighted: useWeighted,
       consecutive: consecutive,
     };
     const diagnostics = D.run(ctx);
@@ -355,6 +393,8 @@
       metrics: metrics,
       bootstrap: bootstrap,
       effSS: effSS,
+      stratified: stratified,
+      useWeighted: useWeighted,
       warning: warning,
       observation: observation,
       verdicts: verdicts,
@@ -404,7 +444,19 @@
       { k: '实际应驳回数', v: String(m.counts.TP + m.counts.FN), s: 'R 的分母' },
       { k: '质检驳回数', v: String(m.counts.TP + m.counts.FP), s: 'P 的分母' },
     ];
-    if (r.effSS) {
+    if (r.useWeighted && r.stratified) {
+      const st = r.stratified;
+      stats.push({
+        k: '召回率有效样本量',
+        v: st.nEff.recall === null ? '无误差' : String(Math.round(st.nEff.recall)),
+        s: '设计效应 ' + (st.designEffect.recall === null ? '—' : st.designEffect.recall.toFixed(2)),
+      });
+      stats.push({
+        k: '总体估计规模',
+        v: String(st.popTotal),
+        s: '加权还原',
+      });
+    } else if (r.effSS) {
       stats.push({ k: '有效样本量', v: String(Math.round(r.effSS.nEffClassic)), s: '原始 ' + r.effSS.nRaw + ' 条' });
     }
     stats.forEach((s) => {
@@ -421,6 +473,10 @@
     const head = el('div', 'card-head');
     head.appendChild(el('h2', null, '指标与置信区间矩阵'));
     const headRight = el('div', 'head-actions');
+    // 口径标注：非等概率分层时展示的是加权后的总体估计，必须显式说明
+    if (r.useWeighted) {
+      headRight.appendChild(el('span', 'badge badge-warn', '加权后总体估计'));
+    }
     headRight.appendChild(el('span', 'hint tiny',
       '区间 ' + Math.round((1 - (r.bootstrap.alpha || 0.05)) * 100) + '%　Bootstrap B=' + r.bootstrap.B));
     head.appendChild(headRight);
@@ -1107,6 +1163,18 @@
       effSS: r.effSS ? {
         nRaw: r.effSS.nRaw, nEffClassic: r.effSS.nEffClassic, designEffect: r.effSS.designEffect,
       } : null,
+      // 记录口径：混用加权与样本内两种尺度会让历史观察线失效，故必须随记录落盘
+      weighting: r.useWeighted && r.stratified ? {
+        mode: 'weighted',
+        popTotal: r.stratified.popTotal,
+        maxDeviation: r.stratified.maxDeviation,
+        designEffectRecall: r.stratified.designEffect.recall,
+        strata: r.stratified.strata.map((s) => ({
+          name: s.name, pop: s.pop, sample: s.sample, weight: s.weight, fpc: s.fpc,
+        })),
+      } : {
+        mode: r.stratified ? (r.stratified.selfWeighting ? 'stratified-selfweighting' : 'sample') : 'sample',
+      },
       warning: {
         baselineB: r.warning.baselineB, toleranceT: r.warning.toleranceT, rMin: r.warning.rMin,
         rMinRaw: r.warning.rMinRaw, fallbackToWorstRecall: r.warning.fallbackToWorstRecall,

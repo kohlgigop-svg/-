@@ -114,28 +114,40 @@
           <details class="strata-block">
             <summary>分层抽样设置（可选）</summary>
             <p class="hint">
-              填写各层的「总体数」与「抽样数」，用于计算有效样本量并标注设计效应。
-              不填则按简单随机抽样处理。
-              <strong>注意：</strong>混淆矩阵仍填抽样内的真实计数，不需加权。
+              <strong>分层依据必须是「质检判定」</strong>——分层要在拿到金标准之前完成，
+              而「实际应驳回」需要先有金标准，无法用来分层。所以：
+            </p>
+            <ul class="plain tiny">
+              <li><strong>驳回层</strong> = 质检判为驳回的数据 → 抽样数应等于 <code>TP + FP</code></li>
+              <li><strong>通过层</strong> = 质检判为通过的数据 → 抽样数应等于 <code>FN + TN</code></li>
+            </ul>
+            <p class="hint">
+              <strong>各层抽样比不同时（过采样），必须填写。</strong>
+              此时直接用抽样内计数会让召回率、特异度、准确率、驳回率系统性偏离真值
+              （实测偏差可达数十个百分点），工具会自动改用加权口径还原总体估计。
+              各层抽样比相同时填与不填结果一致。
+            </p>
+            <p class="hint">
+              <strong>注意：</strong>混淆矩阵仍填抽样内的真实计数，不要自己加权。
             </p>
             <div class="strata-row">
               <label class="field">
-                <span>驳回层 · 总体数</span>
-                <input type="number" id="strataPosPop" min="0" step="1" placeholder="如 1000">
+                <span>驳回层 · 总体数<em>质检共驳回多少条</em></span>
+                <input type="number" id="strataPosPop" min="0" step="1" placeholder="如 10000">
               </label>
               <label class="field">
-                <span>驳回层 · 抽样数</span>
-                <input type="number" id="strataPosSample" min="0" step="1" placeholder="如 400">
+                <span>驳回层 · 抽样数<em>应 = TP + FP</em></span>
+                <input type="number" id="strataPosSample" min="0" step="1" placeholder="如 1000">
               </label>
             </div>
             <div class="strata-row">
               <label class="field">
-                <span>通过层 · 总体数</span>
-                <input type="number" id="strataNegPop" min="0" step="1" placeholder="如 99000">
+                <span>通过层 · 总体数<em>质检共通过多少条</em></span>
+                <input type="number" id="strataNegPop" min="0" step="1" placeholder="如 90000">
               </label>
               <label class="field">
-                <span>通过层 · 抽样数</span>
-                <input type="number" id="strataNegSample" min="0" step="1" placeholder="如 600">
+                <span>通过层 · 抽样数<em>应 = FN + TN</em></span>
+                <input type="number" id="strataNegSample" min="0" step="1" placeholder="如 900">
               </label>
             </div>
           </details>

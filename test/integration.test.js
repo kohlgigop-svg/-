@@ -33,9 +33,20 @@ function computeChain(opts) {
   const input = opts.input;
   const cm = input.cm;
 
-  const metrics = Core.computeMetrics(cm);
+  const metrics0 = Core.computeMetrics(cm);
   const effSS = input.strata && input.strata.length ? Core.effectiveSampleSize(input.strata) : null;
-  const bootstrap = Core.bootstrapF(cm, { B: settings.bootstrapB, alpha: settings.alpha, seed: 20240617 });
+
+  // 与 app.js 的 compute 保持一致：非等概率分层时改用加权口径
+  const stratified = input.strata && input.strata.length
+    ? Core.computeStratified(input.strata, cm,
+      { alpha: settings.alpha, B: settings.bootstrapB, seed: 20240617 })
+    : null;
+  const useWeighted = Core.shouldUseWeighted(stratified);
+  const metrics = useWeighted ? Core.mergeWeightedMetrics(metrics0, stratified) : metrics0;
+  const bootstrap = useWeighted
+    ? { n: stratified.popTotal, B: settings.bootstrapB, alpha: settings.alpha,
+      seed: 20240617, stratified: true, result: stratified.bootF }
+    : Core.bootstrapF(cm, { B: settings.bootstrapB, alpha: settings.alpha, seed: 20240617 });
 
   const history = opts.history || [];
   const historyPi = history.map((r) => r.metrics && r.metrics.piActual).filter(Number.isFinite);
@@ -78,11 +89,12 @@ function computeChain(opts) {
 
   const ctx = {
     metrics, warning, observation, input, projectName: opts.projectName || '测试项目',
-    history, settings, bootstrap, effSS, consecutive,
+    history, settings, bootstrap, effSS, stratified, useWeighted, consecutive,
   };
   const diagnostics = D.run(ctx);
   ctx.diagnostics = diagnostics;
-  return { metrics, bootstrap, effSS, warning, observation, verdicts, recallVerdict, diagnostics, ctx, input, acceptAccuracy: acceptAcc, obsWindow };
+  return { metrics, bootstrap, effSS, stratified, useWeighted, warning, observation,
+    verdicts, recallVerdict, diagnostics, ctx, input, acceptAccuracy: acceptAcc, obsWindow };
 }
 
 function mkHistory(items) {
@@ -226,6 +238,135 @@ console.log('=== 9. 分层抽样 ===');
   ok(r.effSS !== null, '有效样本量已计算');
   ok(r.effSS.nEffClassic < r.effSS.nRaw, 'n_eff < n_raw');
   ok(r.metrics.counts.TP + r.metrics.counts.FP + r.metrics.counts.FN + r.metrics.counts.TN === 1000, '矩阵合计正确');
+}
+
+console.log('=== 9b. 非等概率分层：主口径必须切换为加权估计 ===');
+{
+  // 驳回层抽 10%（1000 条）、通过层抽 1%（900 条）
+  // 总体真值：R=88.89%、Spec=97.80%、π=9.00%
+  const r = computeChain({
+    input: {
+      periodLabel: 'STRAT-1', cm: { TP: 800, FP: 200, FN: 10, TN: 890 },
+      strata: [{ name: '驳回层', pop: 10000, sample: 1000 }, { name: '通过层', pop: 90000, sample: 900 }],
+      acceptAccuracy: 0.95, obsWindow: 3,
+    },
+  });
+  ok(r.stratified !== null && r.stratified !== undefined, '返回分层加权结果 stratified');
+  ok(r.useWeighted === true, '非等抽样比时启用加权口径');
+  ok(Math.abs(r.metrics.recall - 8000 / 9000) < 1e-6,
+    '主口径召回率 = 加权真值 88.89%', String(r.metrics.recall));
+  ok(Math.abs(r.metrics.piActual - 0.09) < 1e-6,
+    '主口径 π = 加权真值 9.00%', String(r.metrics.piActual));
+  ok(Math.abs(r.metrics.specificity - 89000 / 91000) < 1e-6,
+    '主口径特异度 = 加权真值 97.80%', String(r.metrics.specificity));
+  ok(r.metrics.sampleMetrics && Math.abs(r.metrics.sampleMetrics.recall - 800 / 810) < 1e-9,
+    '同时保留样本内口径供对照', r.metrics.sampleMetrics ? String(r.metrics.sampleMetrics.recall) : '(缺失)');
+  // 警戒线必须用加权 π，否则基线 B 会被严重高估
+  ok(Math.abs(r.warning.baselineB - 0.09) < 1e-6,
+    '警戒线基线 B 采用加权 π（而非样本内 42.6%）', String(r.warning.baselineB));
+  // 区间必须展宽
+  ok(r.metrics.ci.recall.hi - r.metrics.ci.recall.lo > 0.05,
+    '召回率区间因设计效应显著展宽',
+    '宽度 ' + (r.metrics.ci.recall.hi - r.metrics.ci.recall.lo).toFixed(4));
+  ok(r.metrics.ci.recall.lo < 8000 / 9000 && r.metrics.ci.recall.hi > 8000 / 9000,
+    '召回率区间覆盖真值');
+  // 诊断卡必须明确警示两种口径的差异
+  const titles = r.diagnostics.map((d) => d.title).join(' | ');
+  ok(/加权|分层|口径/.test(titles), '诊断卡提示了加权口径', titles);
+  const card = r.diagnostics.find((d) => /加权/.test(d.title) || /口径/.test(d.title));
+  ok(!!card, '存在加权口径说明卡');
+  if (card) {
+    ok(card.level === 'warn' || card.level === 'alert',
+      '口径差异达数十个百分点时应为警告级', card.level);
+    has(card.detail, '样本内', '说明卡指出样本内口径有偏');
+  }
+}
+
+console.log('=== 9c. 等概率分层：不应切换口径（自加权） ===');
+{
+  const r = computeChain({
+    input: {
+      periodLabel: 'STRAT-2', cm: { TP: 80, FP: 20, FN: 10, TN: 890 },
+      strata: [{ name: '驳回层', pop: 10000, sample: 100 }, { name: '通过层', pop: 90000, sample: 900 }],
+      acceptAccuracy: 0.95, obsWindow: 3,
+    },
+  });
+  ok(r.useWeighted === false, '等抽样比时不切换口径（结果本就相同）');
+  ok(Math.abs(r.metrics.recall - 80 / 90) < 1e-9, '召回率与样本内一致', String(r.metrics.recall));
+  const card = r.diagnostics.find((d) => /加权/.test(d.title) || /口径/.test(d.title));
+  ok(!card, '自加权时不产生口径差异警示（避免噪声）', card ? card.title : '');
+}
+
+console.log('=== 9d. 分层信息与混淆矩阵不一致：必须报错而非默默加权 ===');
+{
+  const r = computeChain({
+    input: {
+      periodLabel: 'STRAT-3', cm: { TP: 800, FP: 200, FN: 10, TN: 890 },
+      strata: [{ name: '驳回层', pop: 10000, sample: 999 }, { name: '通过层', pop: 90000, sample: 900 }],
+      acceptAccuracy: 0.95, obsWindow: 3,
+    },
+  });
+  ok(r.useWeighted === false, '不一致时不启用加权（避免用错误权重算出错误结论）');
+  const card = r.diagnostics.find((d) => /不一致|不符|对不上/.test(d.title + d.detail));
+  ok(!!card, '存在不一致的诊断卡', r.diagnostics.map((d) => d.title).join(' | '));
+  if (card) ok(card.level === 'alert', '不一致应为最高级别告警', card.level);
+}
+
+console.log('=== 9e. AI 提示词必须包含加权口径与设计效应 ===');
+{
+  const r = computeChain({
+    input: {
+      periodLabel: 'STRAT-4', cm: { TP: 800, FP: 200, FN: 10, TN: 890 },
+      strata: [{ name: '驳回层', pop: 10000, sample: 1000 }, { name: '通过层', pop: 90000, sample: 900 }],
+      acceptAccuracy: 0.95, obsWindow: 3,
+    },
+  });
+  const p = AI.buildUserPayload(r.ctx);
+  has(p, '非等概率分层', '提示词声明为非等概率分层');
+  has(p, '加权', '提示词含加权口径说明');
+  has(p, '设计效应', '提示词含设计效应');
+  has(p, '样本内口径', '提示词同时给出样本内口径以便模型识别差异');
+  ok(/加权后总体估计[^\n]*88\.8|88\.89/.test(p) || p.indexOf('88.89') >= 0,
+    '提示词含加权后的召回率数值', p.slice(0, 200));
+}
+
+console.log('=== 9f. 历史混用两种口径：观察线不可比，必须告警 ===');
+{
+  // 历史前两期是样本内口径，本期切换为加权口径 → 中位数会混用两种尺度
+  const hist = [
+    { periodLabel: 'H1', metrics: { piActual: 0.42, recall: 0.98, precision: 0.8, f1: 0.88, accuracy: 0.89, tauQc: 0.52, specificity: 0.81 }, counts: { TP: 800, FP: 200, FN: 10, TN: 890 }, weighting: { mode: 'sample' } },
+    { periodLabel: 'H2', metrics: { piActual: 0.43, recall: 0.98, precision: 0.79, f1: 0.87, accuracy: 0.88, tauQc: 0.53, specificity: 0.80 }, counts: { TP: 790, FP: 210, FN: 11, TN: 889 }, weighting: { mode: 'sample' } },
+  ];
+  const r = computeChain({
+    input: {
+      periodLabel: 'STRAT-5', cm: { TP: 800, FP: 200, FN: 10, TN: 890 },
+      strata: [{ name: '驳回层', pop: 10000, sample: 1000 }, { name: '通过层', pop: 90000, sample: 900 }],
+      acceptAccuracy: 0.95, obsWindow: 3,
+    },
+    history: hist,
+  });
+  ok(r.useWeighted === true, '本期启用加权');
+  const card = r.diagnostics.find((d) => /口径不一致|不可比|混用/.test(d.title + d.detail));
+  ok(!!card, '存在历史口径混用的告警卡', r.diagnostics.map((d) => d.title).join(' | '));
+  if (card) ok(card.level === 'alert' || card.level === 'warn', '混用口径应至少为警告级', card.level);
+}
+
+console.log('=== 9g. 历史口径一致时不产生噪声告警 ===');
+{
+  const hist = [
+    { periodLabel: 'H1', metrics: { piActual: 0.09, recall: 0.89, precision: 0.8, f1: 0.84, accuracy: 0.97, tauQc: 0.10, specificity: 0.978 }, counts: { TP: 800, FP: 200, FN: 10, TN: 890 }, weighting: { mode: 'weighted' } },
+    { periodLabel: 'H2', metrics: { piActual: 0.09, recall: 0.88, precision: 0.79, f1: 0.83, accuracy: 0.97, tauQc: 0.10, specificity: 0.977 }, counts: { TP: 790, FP: 210, FN: 11, TN: 889 }, weighting: { mode: 'weighted' } },
+  ];
+  const r = computeChain({
+    input: {
+      periodLabel: 'STRAT-6', cm: { TP: 800, FP: 200, FN: 10, TN: 890 },
+      strata: [{ name: '驳回层', pop: 10000, sample: 1000 }, { name: '通过层', pop: 90000, sample: 900 }],
+      acceptAccuracy: 0.95, obsWindow: 3,
+    },
+    history: hist,
+  });
+  const card = r.diagnostics.find((d) => /口径不一致|不可比|混用/.test(d.title + d.detail));
+  ok(!card, '口径一致时不告警', card ? card.title : '');
 }
 
 console.log('=== 10. 首次评估（无历史）===');

@@ -511,6 +511,312 @@
   }
 
   /* ---------------------------------------------------------------------------
+   * 11. 分层抽样：加权估计与设计校正区间
+   * ------------------------------------------------------------------------ */
+
+  /**
+   * 分层依据必须是「质检判定」——分层要在拿到金标准之前完成，
+   * 而「实际应驳回」需要先有金标准，无法用来分层。因此：
+   *     驳回层（positive）= 质检判为驳回 → 内含 TP 与 FP
+   *     通过层（negative）= 质检判为通过 → 内含 FN 与 TN
+   */
+  function strataRole(s) {
+    if (!s) return null;
+    if (s.role === 'positive' || s.role === 'negative') return s.role;
+    const n = String(s.name || '');
+    if (/驳回/.test(n)) return 'positive';
+    if (/通过/.test(n)) return 'negative';
+    return null;
+  }
+
+  /**
+   * 由「层内比例的设计方差」反解有效样本量。
+   *
+   * 常规情形用 n_eff = v(1−v)/Var(v̂)。
+   * 但 v 取到 0 或 1 时 v(1−v)=0 会让定义退化，此时改用「层内比例取 p=0.5
+   * 的最大方差」来定义，得到一个保守但明确的有效样本量。
+   * 若连保守方差都为 0（整层全取 → 无抽样误差），返回 null 表示无抽样误差。
+   */
+  function effNFromVar(value, variance, conservativeVariance) {
+    if (value === null || value === undefined) return null;
+    if (variance > 0 && value > 0 && value < 1) return (value * (1 - value)) / variance;
+    if (conservativeVariance > 0) return 0.25 / conservativeVariance;
+    return null;
+  }
+
+  /** 按有效样本量构造 Wilson 区间；有效样本量为 null 表示无抽样误差 */
+  function ciFromEffN(value, nEff, z) {
+    if (value === null || value === undefined) return { lo: null, hi: null };
+    if (nEff === null || !Number.isFinite(nEff) || nEff <= 0) return { lo: value, hi: value };
+    return wilson(value * nEff, nEff, z);
+  }
+
+  /** 以设计方差抽取一个层内比例（保留有限总体校正） */
+  function drawStratumProportion(rnd, pHat, n, f) {
+    if (pHat === null) return null;
+    if (f >= 1 - 1e-12) return pHat;          // 整层全取：无抽样误差
+    // 令 n_eff = n/(1−f)，则 Bin(n_eff, p)/n_eff 的方差恰为 p(1−p)(1−f)/n
+    const nEff = n / (1 - f);
+    if (nEff <= 20000) {
+      const m = Math.max(1, Math.round(nEff));
+      let hit = 0;
+      for (let i = 0; i < m; i++) if (rnd() < pHat) hit++;
+      return hit / m;
+    }
+    // 极大有效样本量：改用正态近似（此时离散性已无影响）
+    const se = Math.sqrt((pHat * (1 - pHat)) / nEff);
+    const u1 = Math.max(1e-12, rnd());
+    const u2 = rnd();
+    const gauss = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return Math.min(1, Math.max(0, pHat + gauss * se));
+  }
+
+  /**
+   * 分层抽样下的加权估计。
+   *
+   * 为什么必须加权：非等概率分层（例如对「已驳回层」过采样）时，
+   * 直接用抽样内计数算出的 R / Spec / Acc / π / τ 都是有偏的，
+   * 实测偏差可达数十个百分点（见 test/stratified.test.js 的蒙特卡洛验证）。
+   * 只有 P（精确率）与 NPV 不受影响，因为它们完全落在单一层内部。
+   *
+   * @param {Array<{name?:string, role?:string, pop:number, sample:number}>} strata
+   * @param {object} cm {TP,FP,FN,TN}
+   * @param {object} [opts] {alpha, z, B, seed}
+   * @returns {object|null}
+   */
+  function computeStratified(strata, cm, opts) {
+    opts = opts || {};
+    if (!strata || !strata.length || !cm) return null;
+
+    const alpha = opts.alpha || 0.05;
+    const z = opts.z || 1.959963985;
+
+    let pos = null;
+    let neg = null;
+    strata.forEach((s) => {
+      if (!s || !(s.pop > 0) || !(s.sample > 0)) return;
+      const role = strataRole(s);
+      if (role === 'positive' && !pos) pos = s;
+      else if (role === 'negative' && !neg) neg = s;
+    });
+    if (!pos || !neg) return null;
+
+    const TP = Math.max(0, Math.round(cm.TP || 0));
+    const FP = Math.max(0, Math.round(cm.FP || 0));
+    const FN = Math.max(0, Math.round(cm.FN || 0));
+    const TN = Math.max(0, Math.round(cm.TN || 0));
+
+    const n1 = pos.sample;
+    const n2 = neg.sample;
+    const N1 = pos.pop;
+    const N2 = neg.pop;
+    const f1 = Math.min(1, n1 / N1);
+    const f2 = Math.min(1, n2 / N2);
+    const w1 = N1 / n1;
+    const w2 = N2 / n2;
+    const N = N1 + N2;
+
+    /* --- 一致性：层样本量必须与混淆矩阵对应 --- */
+    const reasons = [];
+    if (TP + FP !== n1) reasons.push('驳回层抽样数 ' + n1 + ' 与 TP+FP=' + (TP + FP) + ' 不符');
+    if (FN + TN !== n2) reasons.push('通过层抽样数 ' + n2 + ' 与 FN+TN=' + (FN + TN) + ' 不符');
+    const consistent = reasons.length === 0;
+
+    /* --- 加权到总体的四格计数 --- */
+    const A = w1 * TP;   // 总体 TP
+    const Dp = w1 * FP;  // 总体 FP
+    const Bn = w2 * FN;  // 总体 FN
+    const Cn = w2 * TN;  // 总体 TN
+
+    /* --- 层内比例 --- */
+    const p1 = div(TP, n1);   // 驳回层中「确实该驳回」的比例（数学上即精确率）
+    const p2 = div(FN, n2);   // 通过层中「漏判」的比例
+
+    /* --- 设计方差（含有限总体校正 1−f） --- */
+    const varA = w1 * w1 * n1 * (p1 === null ? 0 : p1 * (1 - p1)) * (1 - f1);
+    const varD = varA;        // FP = n1 − TP，方差同量
+    const varB = w2 * w2 * n2 * (p2 === null ? 0 : p2 * (1 - p2)) * (1 - f2);
+    const varC = varB;        // TN = n2 − FN
+    // p=0.5 的保守方差，供比例取到 0/1 时定义有效样本量
+    const varAc = w1 * w1 * n1 * 0.25 * (1 - f1);
+    const varBc = w2 * w2 * n2 * 0.25 * (1 - f2);
+
+    /* --- 加权点估计 --- */
+    const recall = div(A, A + Bn);
+    const precision = div(A, A + Dp);         // 数学上等于 p1
+    const specificity = div(Cn, Cn + Dp);
+    const npv = div(Cn, Cn + Bn);             // 数学上等于 1 − p2
+    const accuracy = div(A + Cn, N);
+    const piActual = div(A + Bn, N);
+    const tauQc = div(A + Dp, N);             // = N1/N，已知常数
+    const fnr = recall === null ? null : 1 - recall;
+    const fpr = specificity === null ? null : 1 - specificity;
+
+    /* --- 各指标的设计方差（比值用 delta 法；两层相互独立） --- */
+    const ratioVar = (num, den, varNum, varDen) => {
+      const tot = num + den;
+      if (!(tot > 0)) return 0;
+      return (den * den * varNum + num * num * varDen) / Math.pow(tot, 4);
+    };
+    const vRecall = ratioVar(A, Bn, varA, varB);
+    const vRecallC = ratioVar(A, Bn, varAc, varBc);
+    const vSpec = ratioVar(Cn, Dp, varC, varD);
+    const vSpecC = ratioVar(Cn, Dp, varBc, varAc);
+    const vPrec = p1 === null ? 0 : (p1 * (1 - p1) * (1 - f1)) / n1;
+    const vPrecC = (0.25 * (1 - f1)) / n1;
+    const vNpv = p2 === null ? 0 : (p2 * (1 - p2) * (1 - f2)) / n2;
+    const vNpvC = (0.25 * (1 - f2)) / n2;
+    const vAcc = (varA + varC) / (N * N);
+    const vAccC = (varAc + varBc) / (N * N);
+    const vPi = (varA + varB) / (N * N);
+    const vPiC = (varAc + varBc) / (N * N);
+
+    /* --- 有效样本量与区间 --- */
+    const nEff = {
+      recall: effNFromVar(recall, vRecall, vRecallC),
+      precision: effNFromVar(precision, vPrec, vPrecC),
+      specificity: effNFromVar(specificity, vSpec, vSpecC),
+      npv: effNFromVar(npv, vNpv, vNpvC),
+      accuracy: effNFromVar(accuracy, vAcc, vAccC),
+      piActual: effNFromVar(piActual, vPi, vPiC),
+      tauQc: null,   // τ 是已知常数，无抽样误差
+    };
+    const ci = {
+      recall: ciFromEffN(recall, nEff.recall, z),
+      precision: ciFromEffN(precision, nEff.precision, z),
+      specificity: ciFromEffN(specificity, nEff.specificity, z),
+      npv: ciFromEffN(npv, nEff.npv, z),
+      accuracy: ciFromEffN(accuracy, nEff.accuracy, z),
+      piActual: ciFromEffN(piActual, nEff.piActual, z),
+      tauQc: { lo: tauQc, hi: tauQc },
+    };
+
+    /* --- F 族：在分层设计下重采样（P 与 R 经 TP 相关，不能套比例公式） --- */
+    const B = opts.B || 4000;
+    const seed = opts.seed === undefined ? 20240617 : opts.seed;
+    const rnd = mulberry32(seed);
+    const accF = { f05: [], f1: [], f2: [], precision: [], recall: [] };
+    for (let it = 0; it < B; it++) {
+      const s1 = drawStratumProportion(rnd, p1, n1, f1);
+      const s2 = drawStratumProportion(rnd, p2, n2, f2);
+      if (s1 === null || s2 === null) continue;
+      const Aw = w1 * n1 * s1;
+      const Bw = w2 * n2 * s2;
+      const P = s1;                       // 精确率即驳回层内比例
+      const R = div(Aw, Aw + Bw);
+      if (P === null || R === null) continue;
+      accF.precision.push(P);
+      accF.recall.push(R);
+      accF.f1.push(fbetaFromPR(P, R, 1));
+      accF.f05.push(fbetaFromPR(P, R, 0.5));
+      accF.f2.push(fbetaFromPR(P, R, 2));
+    }
+    const bootF = {};
+    ['f05', 'f1', 'f2', 'precision', 'recall'].forEach((k) => {
+      const arr = accF[k].filter((v) => v !== null && Number.isFinite(v)).sort((a, b) => a - b);
+      bootF[k] = arr.length
+        ? { lo: quantile(arr, alpha / 2), hi: quantile(arr, 1 - alpha / 2), used: arr.length }
+        : { lo: null, hi: null, used: 0 };
+    });
+
+    /* --- 样本内（未加权）口径：保留下来用于对照与警示 --- */
+    const nAll = TP + FP + FN + TN;
+    const sampleMetrics = {
+      recall: div(TP, TP + FN),
+      precision: div(TP, TP + FP),
+      specificity: div(TN, TN + FP),
+      npv: div(TN, TN + FN),
+      accuracy: div(TP + TN, nAll),
+      piActual: div(TP + FN, nAll),
+      tauQc: div(TP + FP, nAll),
+    };
+    sampleMetrics.fnr = sampleMetrics.recall === null ? null : 1 - sampleMetrics.recall;
+    sampleMetrics.fpr = sampleMetrics.specificity === null ? null : 1 - sampleMetrics.specificity;
+
+    /* --- 设计效应：原始计数 / 有效样本量 --- */
+    const rawDen = {
+      recall: TP + FN, precision: TP + FP, specificity: TN + FP,
+      npv: TN + FN, accuracy: nAll, piActual: nAll,
+    };
+    const designEffect = {};
+    Object.keys(rawDen).forEach((k) => {
+      designEffect[k] = nEff[k] && nEff[k] > 0 ? rawDen[k] / nEff[k] : null;
+    });
+
+    /* --- 加权与样本内口径的最大偏离：供诊断卡判断是否必须警示 --- */
+    const weighted = { recall, precision, specificity, npv, accuracy, piActual, tauQc };
+    let maxDeviation = 0;
+    Object.keys(weighted).forEach((k) => {
+      if (weighted[k] === null || sampleMetrics[k] === null) return;
+      maxDeviation = Math.max(maxDeviation, Math.abs(weighted[k] - sampleMetrics[k]));
+    });
+
+    return {
+      consistent: consistent,
+      inconsistencyReason: reasons.length ? reasons.join('；') : null,
+      selfWeighting: Math.abs(f1 - f2) < 1e-9,
+      fullyEnumerated: f1 >= 1 - 1e-9 || f2 >= 1 - 1e-9,
+      anyOversampled: f1 > 0.5 + 1e-9 || f2 > 0.5 + 1e-9,
+      popTotal: N,
+      popCounts: { TP: A, FP: Dp, FN: Bn, TN: Cn, N: N },
+      strata: [
+        { name: pos.name || '驳回层', role: 'positive', pop: N1, sample: n1, weight: w1, fpc: f1 },
+        { name: neg.name || '通过层', role: 'negative', pop: N2, sample: n2, weight: w2, fpc: f2 },
+      ],
+      metrics: {
+        accuracy: accuracy, precision: precision, recall: recall,
+        specificity: specificity, npv: npv, fpr: fpr, fnr: fnr,
+        piActual: piActual, tauQc: tauQc,
+        delta: tauQc === null || piActual === null ? null : tauQc - piActual,
+        f05: fbetaFromPR(precision, recall, 0.5),
+        f1: fbetaFromPR(precision, recall, 1),
+        f2: fbetaFromPR(precision, recall, 2),
+      },
+      sampleMetrics: sampleMetrics,
+      ci: ci,
+      nEff: nEff,
+      designEffect: designEffect,
+      bootF: bootF,
+      maxDeviation: maxDeviation,
+      alpha: alpha,
+      seed: seed,
+    };
+  }
+
+  /**
+   * 把分层加权结果合并进标准指标对象。
+   *
+   * 以 computeMetrics 的结果为底（保证字段形状完全一致），
+   * 再用加权口径覆盖点估计与区间，并挂上样本内口径供对照。
+   * 这样下游所有代码（渲染、判定、诊断、提示词）无需区分两条路径。
+   */
+  function mergeWeightedMetrics(base, strat) {
+    if (!base || !strat) return base;
+    const m = Object.assign({}, base);
+    ['accuracy', 'precision', 'recall', 'specificity', 'npv', 'fpr', 'fnr',
+      'f05', 'f1', 'f2', 'piActual', 'tauQc', 'delta'].forEach((k) => {
+      if (strat.metrics[k] !== undefined) m[k] = strat.metrics[k];
+    });
+    m.ci = Object.assign({}, base.ci, strat.ci);
+    m.stratified = true;
+    m.sampleMetrics = strat.sampleMetrics;
+    m.popCounts = strat.popCounts;
+    return m;
+  }
+
+  /**
+   * 判断本次是否应采用加权口径。
+   *
+   * 只有两个条件同时成立才切换：
+   *   1. 分层信息与混淆矩阵自洽——否则权重必然是错的，宁可不加权并告警；
+   *   2. 各层抽样比不同（非自加权）——等概率时加权与样本内在数学上相同，
+   *      切换只会让用户困惑。
+   */
+  function shouldUseWeighted(strat) {
+    return !!(strat && strat.consistent && !strat.selfWeighting);
+  }
+
+  /* ---------------------------------------------------------------------------
    * 导出
    * ------------------------------------------------------------------------ */
 
@@ -528,6 +834,9 @@
     computeMetrics: computeMetrics,
     bootstrapF: bootstrapF,
     effectiveSampleSize: effectiveSampleSize,
+    computeStratified: computeStratified,
+    mergeWeightedMetrics: mergeWeightedMetrics,
+    shouldUseWeighted: shouldUseWeighted,
     computeWarningLine: computeWarningLine,
     computeObservationLines: computeObservationLines,
     consecutiveBreach: consecutiveBreach,

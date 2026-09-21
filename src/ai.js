@@ -109,7 +109,49 @@
     L.push('TN 正确通过 = ' + m.counts.TN);
     L.push('合计 N = ' + m.counts.N);
 
-    if (ctx.effSS) {
+    if (ctx.stratified) {
+      const st = ctx.stratified;
+      L.push('');
+      L.push('===== 三、抽样设计 =====');
+      L.push('抽样方式：' + (st.selfWeighting ? '分层抽样（等抽样比，自加权）' : '非等概率分层抽样'));
+      st.strata.forEach((s) => {
+        L.push('  层「' + s.name + '」：总体 ' + s.pop + ' 条，抽样 ' + s.sample
+          + ' 条，抽样比 ' + pct(s.fpc, 2) + '，权重 ' + num(s.weight, 3));
+      });
+      if (st.consistent === false) {
+        L.push('⚠ 分层信息与混淆矩阵不一致：' + st.inconsistencyReason
+          + '。因此本次未启用加权，下方指标仍为样本内口径，可信度存疑。');
+      } else if (ctx.useWeighted) {
+        L.push('本次已启用加权：下方「四、指标」中的数值是按入样概率还原到总体后的估计。');
+        L.push('加权后总体估计的四格计数：TP≈' + Math.round(st.popCounts.TP)
+          + '，FP≈' + Math.round(st.popCounts.FP)
+          + '，FN≈' + Math.round(st.popCounts.FN)
+          + '，TN≈' + Math.round(st.popCounts.TN)
+          + '（总体 ' + st.popTotal + ' 条）');
+        L.push('样本内口径（未加权，在非等概率分层下有偏，仅供对照）：'
+          + '召回率 ' + pct(st.sampleMetrics.recall, 2)
+          + '、精确率 ' + pct(st.sampleMetrics.precision, 2)
+          + '、特异度 ' + pct(st.sampleMetrics.specificity, 2)
+          + '、准确率 ' + pct(st.sampleMetrics.accuracy, 2)
+          + '、实际应驳回率 ' + pct(st.sampleMetrics.piActual, 2));
+        L.push('两种口径的最大差距 = ' + pct(st.maxDeviation, 2)
+          + '（精确率不受影响，因为它完全落在驳回层内部）');
+        const de = st.designEffect;
+        L.push('设计效应（原始计数 / 有效样本量）：'
+          + '召回率 ' + num(de.recall, 2)
+          + '、特异度 ' + num(de.specificity, 2)
+          + '、准确率 ' + num(de.accuracy, 2)
+          + '、实际应驳回率 ' + num(de.piActual, 2));
+        L.push('召回率有效样本量 ≈ '
+          + (st.nEff.recall === null ? '无抽样误差' : Math.round(st.nEff.recall))
+          + '（原始 TP+FN = ' + (m.counts.TP + m.counts.FN) + '）——'
+          + '这是过采样的代价：该层精度提高，但总体层面的信息量被折算，区间会变宽。');
+      } else {
+        L.push('各层抽样比相同（自加权），加权与样本内口径在数学上一致，故未做换算。');
+      }
+      if (st.anyOversampled) L.push('提示：存在抽样比超过 50% 的层。');
+      if (st.fullyEnumerated) L.push('提示：存在整层全取的层，该层内部无抽样误差。');
+    } else if (ctx.effSS) {
       L.push('');
       L.push('===== 三、抽样设计 =====');
       L.push('抽样方式：分层抽样');

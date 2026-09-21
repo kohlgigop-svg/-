@@ -325,6 +325,9 @@
         diagnostics: r.payload && r.payload.diagnostics ? r.payload.diagnostics : [],
         acceptAccuracy: r.payload ? r.payload.acceptAccuracy : null,
         obsWindow: r.payload ? r.payload.obsWindow : null,
+        // 口径标记必须随记录同步，否则拉回的历史会丢失「加权 / 样本内」信息，
+        // 导致观察线混用两种尺度而无从察觉
+        weighting: r.payload ? r.payload.weighting : null,
         aiSummary: r.payload ? r.payload.aiSummary : null,
         computedAt: r.payload ? r.payload.computedAt : null,
         savedAt: r.createdAt ? new Date(r.createdAt).getTime() : Date.now(),

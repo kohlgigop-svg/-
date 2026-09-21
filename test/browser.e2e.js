@@ -1,4 +1,4 @@
-/* =============================================================================
+﻿/* =============================================================================
  * 浏览器端到端测试：本地 HTTP 服务 + Chrome CDP
  * 验证项：脚本加载无错、界面渲染、计算按钮链路、历史保存/读取、导出、AI 提示词构建
  * ========================================================================== */
@@ -515,6 +515,118 @@ async function main() {
       return { banner: banner };
     `);
     ok(/混淆矩阵为空/.test(emptyRes.banner), '空矩阵给出明确错误提示', emptyRes.banner);
+
+    /* ---------- 非等概率分层：界面必须显示加权口径 ---------- */
+    console.log('\n=== 11b. 非等概率分层：界面展示加权后的总体估计 ===');
+    const weightedUi = await cdp.eval(`
+      return (async () => {
+        window.QCStore.saveSettings({ cloudMode: 'local' });
+        // 驳回层抽 10%、通过层抽 1%：总体真值 R=88.89%、π=9.00%
+        const set = (id, v) => { const n = document.getElementById(id); if (n) n.value = v; };
+        set('cmTP', 800); set('cmFP', 200); set('cmFN', 10); set('cmTN', 890);
+        set('sampleTotal', 1900); set('populationTotal', 100000);
+        set('strataPosPop', 10000); set('strataPosSample', 1000);
+        set('strataNegPop', 90000); set('strataNegSample', 900);
+        const det = document.querySelector('details');
+        if (det) det.open = true;
+        document.getElementById('btnCalc').click();
+        await new Promise(r => setTimeout(r, 2200));
+        const rows = {};
+        document.querySelectorAll('#resultZone .tbl tbody tr').forEach((tr) => {
+          const td = tr.querySelectorAll('td');
+          if (td.length > 2) rows[td[0].textContent.trim()] = td[2].textContent.trim();
+        });
+        const badges = Array.from(document.querySelectorAll('#resultZone .badge')).map(b => b.textContent.trim());
+        const strip = Array.from(document.querySelectorAll('#resultZone .stat')).map(s => ({
+          k: (s.querySelector('.stat-label')||{}).textContent || '',
+          v: (s.querySelector('.stat-value')||{}).textContent || '',
+        }));
+        return { rows, badges, strip };
+      })();
+    `);
+    // 召回率主口径应为加权后的 88.89%，而非样本内的 98.77%
+    ok(/88\.9|88\.89/.test(weightedUi.rows['召回率 R'] || ''),
+      '召回率显示加权后的总体估计（非样本内 98.77%）', String(weightedUi.rows['召回率 R']));
+    ok(/97\.8/.test(weightedUi.rows['特异度 Spec'] || ''),
+      '特异度显示加权后真值（非样本内 81.66%）', String(weightedUi.rows['特异度 Spec']));
+    ok(/加权后总体估计/.test(weightedUi.badges.join(' ')),
+      '结果区标注「加权后总体估计」', weightedUi.badges.join(' / '));
+    const piStat = weightedUi.strip.find((s) => /实际应驳回率/.test(s.k));
+    ok(piStat && /9\.00%/.test(piStat.v),
+      'π 显示加权后的 9.00%（非样本内 42.63%）', piStat ? piStat.v : '(未找到)');
+    const nEffStat = weightedUi.strip.find((s) => /召回率有效样本量/.test(s.k));
+    ok(!!nEffStat, '统计条给出召回率有效样本量', weightedUi.strip.map((s) => s.k).join(' / '));
+    ok(nEffStat && Number(nEffStat.v) < 810,
+      '有效样本量小于原始 TP+FN=810（体现过采样代价）', nEffStat ? nEffStat.v : '');
+
+    // 诊断卡必须解释口径差异
+    const diagWeighted = await cdp.eval(`
+      const cards = Array.from(document.querySelectorAll('#resultZone .diag')).map(c => c.textContent);
+      return { count: cards.length, hasWeightedCard: cards.some(t => /加权/.test(t) && /口径/.test(t)),
+        text: cards.find(t => /加权/.test(t)) || '' };
+    `);
+    ok(diagWeighted.hasWeightedCard === true, '诊断卡解释了加权口径',
+      diagWeighted.text.slice(0, 160));
+
+    // 等概率时不切换口径，且不出现警示卡
+    const selfWeightedUi = await cdp.eval(`
+      return (async () => {
+        const set = (id, v) => { const n = document.getElementById(id); if (n) n.value = v; };
+        set('cmTP', 80); set('cmFP', 20); set('cmFN', 10); set('cmTN', 890);
+        set('sampleTotal', 1000);
+        set('strataPosPop', 10000); set('strataPosSample', 100);
+        set('strataNegPop', 90000); set('strataNegSample', 900);
+        document.getElementById('btnCalc').click();
+        await new Promise(r => setTimeout(r, 2000));
+        const rows = {};
+        document.querySelectorAll('#resultZone .tbl tbody tr').forEach((tr) => {
+          const td = tr.querySelectorAll('td');
+          if (td.length > 2) rows[td[0].textContent.trim()] = td[2].textContent.trim();
+        });
+        const badges = Array.from(document.querySelectorAll('#resultZone .badge')).map(b => b.textContent.trim());
+        const cards = Array.from(document.querySelectorAll('#resultZone .diag')).map(c => c.textContent);
+        return { rows, badges, hasWeightedCard: cards.some(t => /已改用加权口径/.test(t)) };
+      })();
+    `);
+    ok(!/加权后总体估计/.test(selfWeightedUi.badges.join(' ')),
+      '等抽样比时不标注加权（避免噪声）', selfWeightedUi.badges.join(' / '));
+    ok(selfWeightedUi.hasWeightedCard === false, '等抽样比时不产生口径差异警示');
+    ok(/88\.8|88\.89/.test(selfWeightedUi.rows['召回率 R'] || ''),
+      '等抽样比时召回率仍是样本内值', String(selfWeightedUi.rows['召回率 R']));
+
+    /* ---------- 分层信息不一致：必须告警且不加权 ---------- */
+    const inconsistentUi = await cdp.eval(`
+      return (async () => {
+        const set = (id, v) => { const n = document.getElementById(id); if (n) n.value = v; };
+        set('cmTP', 800); set('cmFP', 200); set('cmFN', 10); set('cmTN', 890);
+        set('strataPosPop', 10000); set('strataPosSample', 999);   // 与 TP+FP=1000 不符
+        set('strataNegPop', 90000); set('strataNegSample', 900);
+        document.getElementById('btnCalc').click();
+        await new Promise(r => setTimeout(r, 2000));
+        const cards = Array.from(document.querySelectorAll('#resultZone .diag')).map(c => ({
+          cls: c.className, text: c.textContent,
+        }));
+        const badges = Array.from(document.querySelectorAll('#resultZone .badge')).map(b => b.textContent.trim());
+        return {
+          alertCard: cards.find(c => /不一致/.test(c.text) && /加权口径已停用/.test(c.text)) || null,
+          isAlert: cards.some(c => /不一致/.test(c.text) && /alert/.test(c.cls)),
+          weightedBadge: badges.some(b => /加权后总体估计/.test(b)),
+        };
+      })();
+    `);
+    ok(!!inconsistentUi.alertCard, '分层与矩阵不一致时给出告警卡');
+    ok(inconsistentUi.isAlert === true, '不一致告警为最高级别', JSON.stringify(inconsistentUi.isAlert));
+    ok(inconsistentUi.weightedBadge === false, '不一致时不使用加权口径');
+
+    // 恢复干净状态
+    await cdp.eval(`
+      ['strataPosPop','strataPosSample','strataNegPop','strataNegSample'].forEach(id => {
+        const n = document.getElementById(id); if (n) n.value = '';
+      });
+      document.getElementById('btnSample').click();
+      return 1;
+    `);
+    await sleep(400);
 
     /* ---------- 整页截图 ---------- */
     console.log('\n=== 12. 截图留档 ===');

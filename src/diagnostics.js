@@ -256,7 +256,79 @@
       );
     }
 
-    // 3.3 分层抽样相关
+    // 3.3 分层抽样：口径不自洽（最高优先级——权重错了，结论就全错）
+    if (ctx.stratified && ctx.stratified.consistent === false) {
+      push(
+        LEVEL.alert,
+        '分层信息与混淆矩阵不一致，加权口径已停用',
+        ctx.stratified.inconsistencyReason +
+        '。分层的「驳回层」应恰好对应 TP+FP（质检判为驳回的抽样条数），' +
+        '「通过层」应恰好对应 FN+TN。对不上说明分层口径或矩阵有一方填错，' +
+        '此时用错误权重加权会得到错误结论，故本次仍按样本内口径计算。',
+        ['驳回层抽样数应 = TP+FP', '通过层抽样数应 = FN+TN', ctx.stratified.inconsistencyReason],
+        ['核对分层抽样数与混淆矩阵的对应关系', '确认分层依据是「质检判定」而非「实际应驳回」']
+      );
+    }
+
+    // 3.4 分层抽样：非等概率 → 已切换为加权口径，必须说明差异
+    if (ctx.useWeighted && ctx.stratified) {
+      const st = ctx.stratified;
+      const dev = st.maxDeviation || 0;
+      const sm = st.sampleMetrics;
+      const wm = st.metrics;
+      const pctPt = (a, b) => (a === null || b === null ? '—' : ((a - b) * 100).toFixed(1) + 'pp');
+      const s1 = st.strata[0];
+      const s2 = st.strata[1];
+      push(
+        dev > 0.02 ? LEVEL.warn : LEVEL.info,
+        '非等概率分层：已改用加权口径，样本内口径有偏',
+        '各层抽样比不同（' + s1.name + ' ' + (s1.fpc * 100).toFixed(2) + '%、'
+        + s2.name + ' ' + (s2.fpc * 100).toFixed(2) + '%），'
+        + '此时直接用抽样内计数会系统性偏离总体真值。本次展示的是按入样概率加权后的总体估计。'
+        + '样本内口径与加权口径的差距：召回率 ' + pctPt(sm.recall, wm.recall)
+        + '、特异度 ' + pctPt(sm.specificity, wm.specificity)
+        + '、实际应驳回率 ' + pctPt(sm.piActual, wm.piActual) + '。'
+        + '精确率不受影响（它完全落在驳回层内部）。',
+        [
+          s1.name + '：总体 ' + s1.pop + '，抽样 ' + s1.sample + '，权重 ' + s1.weight.toFixed(2),
+          s2.name + '：总体 ' + s2.pop + '，抽样 ' + s2.sample + '，权重 ' + s2.weight.toFixed(2),
+          '召回率有效样本量 ≈ ' + (st.nEff.recall === null ? '无抽样误差' : st.nEff.recall.toFixed(0))
+            + '（设计效应 ' + (st.designEffect.recall === null ? '—' : st.designEffect.recall.toFixed(2)) + '）',
+        ],
+        [
+          '报告时明确标注为「加权后的总体估计」，不要与样本内口径混用',
+          '各评估周期保持抽样比一致，否则历史观察线不可比',
+          '过采样虽提高该层精度，但总体层面的有效样本量会被折算，区间会变宽',
+        ]
+      );
+    }
+
+    // 3.6 历史口径混用：加权尺度和样本内尺度不可直接相比
+    if (ctx.useWeighted && Array.isArray(ctx.history) && ctx.history.length) {
+      const sampleOnes = ctx.history.filter((h) => h.weighting && h.weighting.mode
+        && h.weighting.mode !== 'weighted');
+      if (sampleOnes.length) {
+        push(
+          LEVEL.warn,
+          '历史记录口径与本期不一致，观察线与趋势不可比',
+          '历史中有 ' + sampleOnes.length + ' 期是按「样本内口径」记录的（未加权），'
+          + '而本期是非等概率分层，已改用「加权后总体估计」。两种口径的数值不在同一尺度上，'
+          + '直接比较会得出错误结论——例如过采样时样本内召回率会偏高、特异度与驳回率会严重偏离。'
+          + '观察线取历史中位数，混用两种口径会让它落到无意义的中间值上。',
+          [
+            '不一致的历史周期：' + sampleOnes.map((h) => h.periodLabel).join('、'),
+            '本期口径：加权后总体估计',
+            '历史口径：样本内（未加权）',
+          ],
+          [
+            '固定抽样方案后，用新口径重新评估若干周期再启用观察线',
+            '或在对比时只看同期同口径的数据，不要跨口径排序',
+          ]
+        );
+      }
+    }
+
+    // 3.5 分层抽样：有效样本量参考（无论是否加权都适用）
     if (ctx.effSS && ctx.effSS.nEffClassic && ctx.effSS.nRaw) {
       const de = ctx.effSS.designEffect;
       if (de && de > 1.05) {
