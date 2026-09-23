@@ -331,7 +331,7 @@
       <div class="subhead"><h3>计算参数</h3></div>
       <div class="form-row">
         <label class="field">
-          <span>Bootstrap 次数</span>
+          <span>Bootstrap 次数<em>只影响 F 族区间的重复精度，不改变数据本身的信息量</em></span>
           <input type="number" id="setBootstrapB" min="500" max="20000" step="500">
         </label>
         <label class="field">
@@ -343,6 +343,13 @@
           </select>
         </label>
       </div>
+      <p class="hint tiny">
+        重采样次数越大，F0.5 / F1 / F2 的区间端点越稳定：同一份数据换个随机种子，
+        B=500 时端点最多会差约 1.4 个百分点，B=4000 时约 0.3 个百分点，B≥8000 后基本不再变化。
+        代价是耗时——B=4000 约 50 ms，B=16000 约 300 ms。
+        <strong>它不会让区间变准，只会让它变稳</strong>：区间宽窄由样本量决定，
+        次数再多也无法凭空产生信息。定期报告用 4000 足够。
+      </p>
       <label class="field">
         <span>AI 输出预算 max_tokens<em>推理模型的思维链与正文共用此预算，过小会导致正文被截断</em></span>
         <input type="number" id="setMaxTokens" min="2000" max="32000" step="1000">

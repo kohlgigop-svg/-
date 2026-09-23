@@ -276,14 +276,19 @@
      * 非等概率分层（例如对「已驳回层」过采样）下，直接用抽样内计数算出的
      * R / Spec / Acc / π / τ 都是有偏的，实测偏差可达数十个百分点，
      * 且朴素置信区间在模拟中从未覆盖真值。详见 test/stratified.test.js。 */
-    const stratified = input.strata.length
+    // 先做一次不带重采样的轻量计算，判断是否真的要用加权口径
+    const stratLite = input.strata.length
+      ? C.computeStratified(input.strata, cm, { skipBootstrap: true })
+      : null;
+    const useWeighted = C.shouldUseWeighted(stratLite);
+    // 只有确实采用加权时才做分层重采样（F 族区间），避免与朴素 Bootstrap 重复算两遍
+    const stratified = (useWeighted && stratLite)
       ? C.computeStratified(input.strata, cm, {
         alpha: settings.alpha || 0.05,
         B: settings.bootstrapB || 4000,
         seed: 20240617,
       })
-      : null;
-    const useWeighted = C.shouldUseWeighted(stratified);
+      : stratLite;
 
     const baseMetrics = C.computeMetrics(cm);
     const metrics = useWeighted ? C.mergeWeightedMetrics(baseMetrics, stratified) : baseMetrics;

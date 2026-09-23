@@ -691,33 +691,38 @@
       tauQc: { lo: tauQc, hi: tauQc },
     };
 
-    /* --- F 族：在分层设计下重采样（P 与 R 经 TP 相关，不能套比例公式） --- */
+    /* --- F 族：在分层设计下重采样（P 与 R 经 TP 相关，不能套比例公式） ---
+     * skipBootstrap：调用方若已判定不会采用加权口径（等抽样比或分层不自洽），
+     * 可跳过多项式重采样。否则主程序会先把这里算一遍、再算一遍朴素 Bootstrap，
+     * 等于每次计算做两遍重采样，B 调大时开销直接翻倍。 */
+    const bootF = {};
     const B = opts.B || 4000;
     const seed = opts.seed === undefined ? 20240617 : opts.seed;
-    const rnd = mulberry32(seed);
-    const accF = { f05: [], f1: [], f2: [], precision: [], recall: [] };
-    for (let it = 0; it < B; it++) {
-      const s1 = drawStratumProportion(rnd, p1, n1, f1);
-      const s2 = drawStratumProportion(rnd, p2, n2, f2);
-      if (s1 === null || s2 === null) continue;
-      const Aw = w1 * n1 * s1;
-      const Bw = w2 * n2 * s2;
-      const P = s1;                       // 精确率即驳回层内比例
-      const R = div(Aw, Aw + Bw);
-      if (P === null || R === null) continue;
-      accF.precision.push(P);
-      accF.recall.push(R);
-      accF.f1.push(fbetaFromPR(P, R, 1));
-      accF.f05.push(fbetaFromPR(P, R, 0.5));
-      accF.f2.push(fbetaFromPR(P, R, 2));
+    if (!opts.skipBootstrap) {
+      const rnd = mulberry32(seed);
+      const accF = { f05: [], f1: [], f2: [], precision: [], recall: [] };
+      for (let it = 0; it < B; it++) {
+        const s1 = drawStratumProportion(rnd, p1, n1, f1);
+        const s2 = drawStratumProportion(rnd, p2, n2, f2);
+        if (s1 === null || s2 === null) continue;
+        const Aw = w1 * n1 * s1;
+        const Bw = w2 * n2 * s2;
+        const P = s1;                       // 精确率即驳回层内比例
+        const R = div(Aw, Aw + Bw);
+        if (P === null || R === null) continue;
+        accF.precision.push(P);
+        accF.recall.push(R);
+        accF.f1.push(fbetaFromPR(P, R, 1));
+        accF.f05.push(fbetaFromPR(P, R, 0.5));
+        accF.f2.push(fbetaFromPR(P, R, 2));
+      }
+      ['f05', 'f1', 'f2', 'precision', 'recall'].forEach((k) => {
+        const arr = accF[k].filter((v) => v !== null && Number.isFinite(v)).sort((a, b) => a - b);
+        bootF[k] = arr.length
+          ? { lo: quantile(arr, alpha / 2), hi: quantile(arr, 1 - alpha / 2), used: arr.length }
+          : { lo: null, hi: null, used: 0 };
+      });
     }
-    const bootF = {};
-    ['f05', 'f1', 'f2', 'precision', 'recall'].forEach((k) => {
-      const arr = accF[k].filter((v) => v !== null && Number.isFinite(v)).sort((a, b) => a - b);
-      bootF[k] = arr.length
-        ? { lo: quantile(arr, alpha / 2), hi: quantile(arr, 1 - alpha / 2), used: arr.length }
-        : { lo: null, hi: null, used: 0 };
-    });
 
     /* --- 样本内（未加权）口径：保留下来用于对照与警示 --- */
     const nAll = TP + FP + FN + TN;
