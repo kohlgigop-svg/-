@@ -6,6 +6,8 @@ const path = require('path');
 const suites = [
   ['内核单元测试', 'core.test.js'],
   ['分层加权估计', 'stratified.test.js'],
+  ['设置读写一致性', 'settings.test.js'],
+  ['网络重试逻辑', 'net-retry.test.js'],
   ['集成测试', 'integration.test.js'],
   ['AI 代理逻辑', 'ai-proxy.test.js'],
   ['浏览器端到端', 'browser.e2e.js'],

@@ -141,12 +141,13 @@
     const saved = readJSON(K_SETTINGS, {});
     // 优先级：本地已保存 > 部署配置 > 内置默认
     const out = Object.assign({}, DEFAULT_SETTINGS, configToSettings(cfg), saved);
-    // 部署方锁定项一律以部署配置为准，防止成员误改导致全员不可用
+    // 部署方锁定项一律以部署配置为准，防止成员误改导致凭据/共享配置不一致。
+    // 注意：这里只强制「锁定项」，与 isLocked() 的判定口径必须一致——
+    // 否则会出现「界面可编辑、保存后却被配置盖回」的假可编辑缺陷
+    // （accepted 曾因此把 Bootstrap 次数改不动）。
     if (cfg.lockDeployment) {
-      const forced = configToSettings(cfg);
-      Object.keys(forced).forEach((k) => {
-        if (k === 'apiKey' && cfg.allowUserAiKey) return; // Key 由成员自己填
-        out[k] = forced[k];
+      Object.keys(out).forEach((k) => {
+        if (isLocked(k)) out[k] = configToSettings(cfg)[k];
       });
     }
     return out;

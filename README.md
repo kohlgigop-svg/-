@@ -182,6 +182,25 @@ n_eff(经典) = (Σw)² / Σw²            w = 1/入样概率
 
 ### 锁定机制
 
+`config.js` 里 `lockDeployment: true` 时，**只有凭据与共享配置会被锁定**：
+
+| 锁定（成员改不了） | 不锁定（成员可在设置里改） |
+|---|---|
+| `cloudUrl` / `cloudKey` / `cloudCode` / `cloudMode` | `bootstrapB`（Bootstrap 次数） |
+| `aiProxyUrl` / `aiBase` / `aiModel` | `alpha`（置信水平） |
+| `apiKey`（启用代理时自动锁定） | `obsWindow`（观察线窗口） |
+| | `acceptAccuracy` / `maxTokens` |
+
+> **重要**：配置里的计算参数（`bootstrapB`、`alpha`、`obsWindow`、`acceptAccuracy`、`maxTokens`）
+> 只作为**默认值**——成员未修改时采用它，改过之后以成员保存的为准。
+>
+> 判定的唯一依据是 `isLocked()`：**凡界面允许编辑的字段，保存后一定能读回来**；
+> 凡界面锁定的字段，一定以部署配置为准。这两者口径必须一致，
+> 否则会出现「看起来能改、改了没用」的假可编辑（曾真实发生过）。
+> 相关回归测试见 `test/settings.test.js`（36 项）。
+
+### 界面不显示任何凭据
+
 `config.js` 里 `lockDeployment: true` 时：
 
 - **设置界面不显示、也不允许修改任何凭据**：云端 URL、anon key、访问码、AI 代理地址、API Key 全部从界面移除

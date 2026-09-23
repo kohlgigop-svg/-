@@ -14,6 +14,65 @@
 
   const SESSION_KEY = 'qceval:cloud:session';
 
+  /**
+   * 带重试的请求。
+   *
+   * 为什么需要：实测出现 ECONNRESET（连接被重置）——常见于网络抖动、
+   * 频繁建连、或本机端口资源紧张。这类错误是瞬时的，重试一次即可成功；
+   * 若不重试，用户会在一次网络抖动后看到「失败」，而其实什么都没坏。
+   *
+   * 重试边界（重要）：
+   *   - 只重试「网络层异常」（fetch 直接抛错）
+   *   - 服务端明确返回的状态码（401/403/409/…）一律不重试，
+   *     因为那是真实业务结果，重试会掩盖问题
+   */
+  const RETRY_MAX = 3;
+  const RETRY_BASE_MS = 400;
+
+  function sleepMs(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /**
+   * 判断是否为「网络层」异常。
+   *
+   * 关键：Node / 浏览器的 fetch 失败时，顶层往往只是笼统的
+   *   TypeError: fetch failed
+   * 真正的错误码藏在 e.cause 里（如 { code: 'ECONNRESET' }）。
+   * 只检查 message 会漏判，导致「该重试却一次都不重试」——
+   * 这一点正是在真实 ECONNRESET 场景下被测试抓出来的。
+   */
+  function looksLikeNetworkError(e) {
+    if (!e) return false;
+    const parts = [];
+    let cur = e;
+    for (let depth = 0; cur && depth < 5; depth++) {
+      parts.push(String(cur.message || ''), String(cur.name || ''));
+      if (cur.code) parts.push(String(cur.code));
+      if (cur.errno) parts.push(String(cur.errno));
+      if (cur.syscall) parts.push(String(cur.syscall));
+      cur = cur.cause;
+    }
+    const text = parts.join(' | ');
+    return /failed to fetch|networkerror|load failed|fetch failed|econnreset|etimedout|enotfound|econnrefused|econnaborted|epipe|enetunreach|ehostunreach|socket hang up|network request failed|connection reset/i.test(text);
+  }
+
+  async function fetchRetry(url, init) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= RETRY_MAX; attempt++) {
+      try {
+        return await fetch(url, init);
+      } catch (e) {
+        if (!looksLikeNetworkError(e)) throw e;
+        lastErr = e;
+        if (attempt === RETRY_MAX) break;
+        await sleepMs(RETRY_BASE_MS * Math.pow(2, attempt));
+      }
+    }
+    throw new Error('网络连接不稳定（' + (lastErr ? lastErr.message : '未知') + '），已重试 '
+      + RETRY_MAX + ' 次仍未成功。请检查网络后重试。');
+  }
+
   function cfgFrom(settings) {
     const s = settings || {};
     return {
@@ -129,7 +188,7 @@
       }
     }
 
-    const resp = await fetch(c.url + '/auth/v1/signup', {
+    const resp = await fetchRetry(c.url + '/auth/v1/signup', {
       method: 'POST',
       headers: { apikey: c.key, 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: {}, gotrue_meta_security: {} }),
@@ -156,7 +215,7 @@
       const exp = session.expires_at ? session.expires_at * 1000 : 0;
       if (exp && exp - Date.now() < 60 * 1000) {
         try {
-          const resp = await fetch(c.url + '/auth/v1/token?grant_type=refresh_token', {
+          const resp = await fetchRetry(c.url + '/auth/v1/token?grant_type=refresh_token', {
             method: 'POST',
             headers: { apikey: c.key, 'Content-Type': 'application/json' },
             body: JSON.stringify({ refresh_token: session.refresh_token }),
@@ -207,7 +266,7 @@
 
     let resp;
     try {
-      resp = await fetch(c.url + '/rest/v1/rpc/' + fn, {
+      resp = await fetchRetry(c.url + '/rest/v1/rpc/' + fn, {
         method: 'POST', headers: headers, body: JSON.stringify(args || {}),
       });
     } catch (e) {
@@ -219,7 +278,7 @@
       saveSession(null);
       const fresh = await signInAnon(settings, true);
       try {
-        resp = await fetch(c.url + '/rest/v1/rpc/' + fn, {
+        resp = await fetchRetry(c.url + '/rest/v1/rpc/' + fn, {
           method: 'POST',
           headers: { apikey: c.key, Authorization: 'Bearer ' + fresh.access_token, 'Content-Type': 'application/json' },
           body: JSON.stringify(args || {}),

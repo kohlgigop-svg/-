@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { writeFile, mkdir } = require('fs/promises');
+const { killChromeTree } = require('./_chrome.js');
 
 const ROOT = path.join(__dirname, '..');
 const SHOT_DIR = path.join(ROOT, 'test', 'screenshots');
@@ -853,10 +854,11 @@ async function main() {
     ok(icon.status === 200, 'favicon.svg 可访问', 'HTTP ' + icon.status);
 
   } finally {
-    try { chrome.kill(); } catch (e) { /* 忽略 */ }
+    // 必须终止整棵进程树：只 kill 启动器会留下十余个孤儿 chrome.exe，
+    // 累积后会耗尽本机资源，导致后续网络请求 ECONNRESET（曾真实发生）
+    killChromeTree(chrome, USER_DATA);
     server.close();
     await sleep(500);
-    try { if (fs.existsSync(USER_DATA)) fs.rmSync(USER_DATA, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
   }
 
   console.log('\n────────────────────────────────');

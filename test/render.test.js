@@ -1,4 +1,4 @@
-/* =============================================================================
+﻿/* =============================================================================
  * 渲染验证：布局、溢出、画布像素、颜色对比
  * 不依赖人眼——用 DOM 几何、计算样式与画布像素做程序化断言
  * ========================================================================== */
@@ -7,6 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { killChromeTree } = require('./_chrome.js');
 
 const ROOT = path.join(__dirname, '..');
 const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
@@ -349,10 +350,10 @@ async function main() {
     ok(junk.len > 2000, '结果区有实质内容', String(junk.len));
 
   } finally {
-    try { chrome.kill(); } catch (e) { /* 忽略 */ }
+    // 必须终止整棵进程树，否则残留的孤儿 Chrome 会耗尽本机资源
+    killChromeTree(chrome, USER_DATA);
     server.close();
     await sleep(400);
-    try { if (fs.existsSync(USER_DATA)) fs.rmSync(USER_DATA, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
   }
 
   console.log('\n────────────────────────────────');

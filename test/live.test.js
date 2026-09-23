@@ -1,4 +1,4 @@
-/* =============================================================================
+﻿/* =============================================================================
  * 线上部署验证：对 GitHub Pages 站点做真实浏览器验收
  * 验证：页面可访问、资源加载、计算链路、AI 直连 CORS、与本地版本一致
  * ========================================================================== */
@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { killChromeTree } = require('./_chrome.js');
 
 const SITE = 'https://kohlgigop-svg.github.io/-/';
 const LOCAL = path.join(__dirname, '..');
@@ -404,9 +405,9 @@ async function main() {
     ok(icon.status === 200, 'favicon.svg 可访问', 'HTTP ' + icon.status);
 
   } finally {
-    try { chrome.kill(); } catch (e) { /* 忽略 */ }
+    // 必须终止整棵进程树，否则残留的孤儿 Chrome 会耗尽本机资源
+    killChromeTree(chrome, USER_DATA);
     await sleep(400);
-    try { if (fs.existsSync(USER_DATA)) fs.rmSync(USER_DATA, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
   }
 
   console.log('\n────────────────────────────────');
